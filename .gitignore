@@ -1,0 +1,17 @@
+# Rust build artifacts
+rust_src/target/
+rust_src/Cargo.lock
+
+# Python cache and temp files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Packaged add-on binary
+*.nvda-addon
+
