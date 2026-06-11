@@ -39,6 +39,9 @@ jobs:
       with:
         workspaces: "rust_src -> target"
 
+    - name: Set up MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
     - name: Build and Package NVDA Add-on
       run: |
         python build.py --all

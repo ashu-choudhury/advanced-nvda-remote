@@ -12,11 +12,7 @@ os.environ["CMAKE"] = os.path.abspath("cmake_wrapper.bat")
 os.environ["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 os.environ["CMAKE_VAR_CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 
-# Instruct PyO3 to bypass Python interpreter lookup and use raw-dylib linking (for cross-compilation)
-os.environ["PYO3_NO_PYTHON"] = "1"
-
-# Signal that we are building an extension module so PyO3 does not link against python3.lib on Windows
-os.environ["PYO3_BUILD_EXTENSION_MODULE"] = "1"
+# PYO3 environment variables are configured per-target in compile_and_copy
 
 def get_host_arch():
     # Detect host processor architecture and bitness
@@ -40,13 +36,30 @@ def compile_and_copy(target_name, arch_folder):
     except Exception as e:
         print(f"Warning: Failed to run rustup target add {target_name}: {e}")
         
+    # Prepare environment and features dynamically
+    env = os.environ.copy()
+    host_arch, host_target = get_host_arch()
+    is_cross = (target_name != host_target)
+    
     cmd = [
         "cargo", "build",
         "--manifest-path", "rust_src/Cargo.toml",
         "--target", target_name,
         "--release"
     ]
-    subprocess.run(cmd, check=True)
+    
+    if is_cross:
+        print(f"Cross-compilation detected for target {target_name}. Enabling PyO3 generate-import-lib feature.")
+        env["PYO3_NO_PYTHON"] = "1"
+        env["PYO3_BUILD_EXTENSION_MODULE"] = "1"
+        cmd.extend(["--features", "pyo3/generate-import-lib"])
+    else:
+        print(f"Host architecture compilation detected. Using local Python environment.")
+        # Ensure we don't inherit cross-compilation overrides
+        env.pop("PYO3_NO_PYTHON", None)
+        env.pop("PYO3_BUILD_EXTENSION_MODULE", None)
+        
+    subprocess.run(cmd, env=env, check=True)
     
     # Path to release DLL
     dll_path = os.path.join("rust_src", "target", target_name, "release", "p2p_webrtc.dll")
