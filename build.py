@@ -30,6 +30,13 @@ def get_host_arch():
 def compile_and_copy(target_name, arch_folder):
     print(f"Building for target {target_name}...")
     
+    # Clean previous build artifacts to prevent cross-contamination of host/target libraries
+    print("Cleaning previous build artifacts...")
+    try:
+        subprocess.run(["cargo", "clean", "--manifest-path", "rust_src/Cargo.toml"], check=True)
+    except Exception as e:
+        print(f"Warning: Failed to run cargo clean: {e}")
+        
     # Ensure rustup target is installed
     try:
         subprocess.run(["rustup", "target", "add", target_name], check=True)
