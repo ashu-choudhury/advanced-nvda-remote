@@ -62,6 +62,28 @@ def package():
     package_addon.package()
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Build and package advanced-nvda-remote add-on")
+    parser.add_argument("--test", action="store_true", help="Run the Rust test suite")
+    args = parser.parse_args()
+    
+    if args.test:
+        arch_folder, target_name = get_host_arch()
+        print(f"Running cargo test for target {target_name}...")
+        cmd = [
+            "cargo", "test",
+            "--manifest-path", "rust_src/Cargo.toml",
+            "--target", target_name,
+            "--", "--nocapture"
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            print("Tests completed successfully!")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error running tests: {e}")
+            sys.exit(1)
+
     try:
         compile_and_copy()
     except Exception as e:
