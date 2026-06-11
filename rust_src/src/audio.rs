@@ -91,9 +91,47 @@ impl AudioPipeline {
         let output_device = host.default_output_device()
             .ok_or_else(|| "Failed to find default output device (speaker)".to_string())?;
 
-        let stream_config = cpal::StreamConfig {
-            channels: 1,
-            sample_rate: cpal::SampleRate(48000),
+        // Query default config and search for 48kHz support for input device
+        let default_input_config = input_device.default_input_config()
+            .map_err(|e| format!("Failed to get default input config: {:?}", e))?;
+        let mut target_input_sample_rate = cpal::SampleRate(48000);
+        let mut target_input_channels = default_input_config.channels();
+
+        if let Ok(supported_configs) = input_device.supported_input_configs() {
+            for config in supported_configs {
+                if config.min_sample_rate().0 <= 48000 && 48000 <= config.max_sample_rate().0 {
+                    target_input_sample_rate = cpal::SampleRate(48000);
+                    target_input_channels = config.channels();
+                    break;
+                }
+            }
+        }
+
+        let input_stream_config = cpal::StreamConfig {
+            channels: target_input_channels,
+            sample_rate: target_input_sample_rate,
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        // Query default config and search for 48kHz support for output device
+        let default_output_config = output_device.default_output_config()
+            .map_err(|e| format!("Failed to get default output config: {:?}", e))?;
+        let mut target_output_sample_rate = cpal::SampleRate(48000);
+        let mut target_output_channels = default_output_config.channels();
+
+        if let Ok(supported_configs) = output_device.supported_output_configs() {
+            for config in supported_configs {
+                if config.min_sample_rate().0 <= 48000 && 48000 <= config.max_sample_rate().0 {
+                    target_output_sample_rate = cpal::SampleRate(48000);
+                    target_output_channels = config.channels();
+                    break;
+                }
+            }
+        }
+
+        let output_stream_config = cpal::StreamConfig {
+            channels: target_output_channels,
+            sample_rate: target_output_sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -107,16 +145,32 @@ impl AudioPipeline {
         let mut capture_buffer = Vec::new();
         let apm_capture = Arc::clone(&apm);
         let is_muted_capture = Arc::clone(&is_muted);
+        let num_input_channels = target_input_channels as usize;
         
         let input_stream = input_device.build_input_stream(
-            &stream_config,
+            &input_stream_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 // If microphone is muted, skip capture entirely
                 if *is_muted_capture.lock().unwrap() {
                     return;
                 }
 
-                capture_buffer.extend_from_slice(data);
+                // Downmix input channels to Mono
+                if num_input_channels == 1 {
+                    capture_buffer.extend_from_slice(data);
+                } else {
+                    let mut i = 0;
+                    while i < data.len() {
+                        let mut sum = 0.0;
+                        for _ in 0..num_input_channels {
+                            if i < data.len() {
+                                sum += data[i];
+                                i += 1;
+                            }
+                        }
+                        capture_buffer.push(sum / (num_input_channels as f32));
+                    }
+                }
                 
                 // Sonora processes exactly 10ms (480 samples at 48kHz) chunks
                 while capture_buffer.len() >= 480 {
@@ -153,11 +207,26 @@ impl AudioPipeline {
 
         // Playback stream
         let jb_playback = Arc::clone(&jitter_buffer);
+        let output_channels = target_output_channels as usize;
         let output_stream = output_device.build_output_stream(
-            &stream_config,
+            &output_stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut jb = jb_playback.lock().unwrap();
-                jb.pop(data);
+                if output_channels == 1 {
+                    jb.pop(data);
+                } else {
+                    let mut mono_buffer = vec![0.0f32; data.len() / output_channels];
+                    jb.pop(&mut mono_buffer);
+                    let mut write_idx = 0;
+                    for &sample in &mono_buffer {
+                        for _ in 0..output_channels {
+                            if write_idx < data.len() {
+                                data[write_idx] = sample;
+                                write_idx += 1;
+                            }
+                        }
+                    }
+                }
             },
             |err| {
                 eprintln!("Audio output stream error: {:?}", err);
