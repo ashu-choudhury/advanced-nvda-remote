@@ -18,3 +18,10 @@ cpal = "0.15"
 opus = "0.3"
 sonora = "0.1"
 bytes = "1.6"
+
+[build-dependencies]
+pyo3-build-config = { version = "0.22.6", features = ["generate-import-lib"], optional = true }
+
+[features]
+generate-import-lib = ["dep:pyo3-build-config", "pyo3/generate-import-lib"]
+

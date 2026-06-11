@@ -59,7 +59,7 @@ def compile_and_copy(target_name, arch_folder):
         print(f"Cross-compilation detected for target {target_name}. Enabling PyO3 generate-import-lib feature.")
         env["PYO3_NO_PYTHON"] = "1"
         env["PYO3_BUILD_EXTENSION_MODULE"] = "1"
-        cmd.extend(["--features", "pyo3/generate-import-lib"])
+        cmd.extend(["--features", "generate-import-lib"])
     else:
         print(f"Host architecture compilation detected. Using local Python environment.")
         # Ensure we don't inherit cross-compilation overrides
