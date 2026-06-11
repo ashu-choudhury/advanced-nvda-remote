@@ -12,6 +12,9 @@ os.environ["CMAKE"] = os.path.abspath("cmake_wrapper.bat")
 os.environ["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 os.environ["CMAKE_VAR_CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 
+# Instruct PyO3 to bypass Python interpreter lookup and use raw-dylib linking (for cross-compilation)
+os.environ["PYO3_NO_PYTHON"] = "1"
+
 def get_host_arch():
     # Detect host processor architecture and bitness
     machine = platform.machine().lower()
@@ -93,13 +96,20 @@ def main():
         print(f"No target specified. Building for host architecture: {arch} ({target})")
         targets = [(target, arch)]
         
+    failed_targets = []
     for target, arch in targets:
         try:
             compile_and_copy(target, arch)
         except Exception as e:
             print(f"Error building for target {target}: {e}")
+            failed_targets.append(target)
             if not args.all:
                 sys.exit(1)
+                
+    if failed_targets:
+        print(f"\nERROR: Failed to compile for the following targets: {', '.join(failed_targets)}")
+        print("Packaging aborted. Please ensure you have the required compiler toolchains installed.")
+        sys.exit(1)
                 
     # Run packaging
     print("Packaging add-on...")
