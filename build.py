@@ -15,6 +15,9 @@ os.environ["CMAKE_VAR_CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 # Instruct PyO3 to bypass Python interpreter lookup and use raw-dylib linking (for cross-compilation)
 os.environ["PYO3_NO_PYTHON"] = "1"
 
+# Signal that we are building an extension module so PyO3 does not link against python3.lib on Windows
+os.environ["PYO3_BUILD_EXTENSION_MODULE"] = "1"
+
 def get_host_arch():
     # Detect host processor architecture and bitness
     machine = platform.machine().lower()
