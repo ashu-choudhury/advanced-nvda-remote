@@ -82,94 +82,112 @@ class P2PRelayTransport(RelayTransport):
 
         self.closed = False
         self.use_webrtc = False
+        self.webrtc_started = False
         self.sig_candidates_sent.clear()
-        p2p_webrtc.close()
-        
-        log.info(f"P2P Override: Connecting to relay server {self.address} for signaling...")
+        last_audio_check = 0.0
+
         try:
-            self.serverSock = self.createOutboundSocket(*self.address, insecure=self.insecure)
-            self.serverSock.connect(self.address)
-            self.relay_sock = self.serverSock
-        except Exception as e:
-            log.error(f"P2P Override: Failed to connect to relay server: {e}")
-            self.transportConnectionFailed.notify()
-            raise
+            p2p_webrtc.close()
+            log.info(f"P2P Override: Connecting to relay server {self.address} for signaling...")
+            try:
+                self.serverSock = self.createOutboundSocket(*self.address, insecure=self.insecure)
+                self.serverSock.connect(self.address)
+                self.relay_sock = self.serverSock
+            except Exception as e:
+                log.error(f"P2P Override: Failed to connect to relay server: {e}")
+                self.transportConnectionFailed.notify()
+                raise
 
-        self.onTransportConnected()
-        self.startQueueThread()
+            self.onTransportConnected()
+            self.startQueueThread()
 
-        # Main read loop: select on relay socket first, then poll WebRTC once connected
-        while not self.closed:
-            if not self.use_webrtc:
-                # Read from relay socket
-                try:
-                    readers, _, error = select.select([self.relay_sock], [], [self.relay_sock], 0.1)
-                except (socket.error, ValueError):
-                    break
-                if self.relay_sock in error:
-                    break
-                if self.relay_sock in readers:
+            # Main read loop: select on relay socket first, then poll WebRTC once connected
+            while not self.closed:
+                if not self.use_webrtc:
+                    # Read from relay socket
                     try:
-                        self.processIncomingSocketData()
-                    except socket.error:
+                        readers, _, error = select.select([self.relay_sock], [], [self.relay_sock], 0.1)
+                    except (socket.error, ValueError):
                         break
-                
-                # Check for gathered local ICE candidates to transmit
-                try:
-                    candidates = p2p_webrtc.get_local_candidates()
-                    for cand in candidates:
-                        if cand not in self.sig_candidates_sent:
-                            self.sig_candidates_sent.add(cand)
-                            log.info(f"P2P Override: Sending gathered ICE candidate...")
-                            self.send_to_relay(type="p2p_ice", candidate=cand)
-                except Exception as e:
-                    log.error(f"P2P Override: Error gathering ICE candidates: {e}")
-
-                # Check if WebRTC P2P Data Channel has connected
-                if p2p_webrtc.is_connected():
-                    log.info("P2P Override: WebRTC Data Channel is connected! Swapping transport...")
-                    self.use_webrtc = True
-                    # Safely close the relay server socket
-                    with self.serverSockLock:
-                        if self.relay_sock:
-                            self.relay_sock.close()
-                            self.relay_sock = None
-                            self.serverSock = None
-                    log.info("P2P Override: Relay socket closed. Direct WebRTC P2P channel is active.")
+                    if self.relay_sock in error:
+                        break
+                    if self.relay_sock in readers:
+                        try:
+                            self.processIncomingSocketData()
+                        except socket.error:
+                            break
+                    
+                    # Check for gathered local ICE candidates to transmit
                     try:
-                        p2p_webrtc.start_audio()
-                        log.info("P2P Override: Audio pipeline started successfully.")
+                        candidates = p2p_webrtc.get_local_candidates()
+                        for cand in candidates:
+                            if cand not in self.sig_candidates_sent:
+                                self.sig_candidates_sent.add(cand)
+                                log.info(f"P2P Override: Sending gathered ICE candidate...")
+                                self.send_to_relay(type="p2p_ice", candidate=cand)
                     except Exception as e:
-                        log.error(f"P2P Override: Failed to start audio pipeline: {e}")
-            else:
-                # Read from direct WebRTC Data Channel
-                try:
-                    msg = p2p_webrtc.recv_message()
-                    if msg:
-                        # Append a newline because NVDA's deserializer expects lines
-                        line = (msg + "\n").encode("utf-8")
-                        self.parse(line)
-                    else:
-                        time.sleep(0.005) # Prevent CPU spinning
-                except Exception as e:
-                    log.error(f"P2P Override: Error in WebRTC message polling: {e}")
-                    break
-                
-                # Check for disconnect
-                if not p2p_webrtc.is_connected():
-                    log.warn("P2P Override: WebRTC Data Channel disconnected.")
-                    break
+                        log.error(f"P2P Override: Error gathering ICE candidates: {e}")
 
-        log.info("P2P Override: Exited transport read loop. Cleaning up...")
-        self.connected = False
-        self.connectedEvent.clear()
-        self.transportDisconnected.notify()
-        self._disconnect()
-        try:
-            p2p_webrtc.stop_audio()
-        except Exception:
-            pass
-        p2p_webrtc.close()
+                    # Check if WebRTC P2P Data Channel has connected
+                    if p2p_webrtc.is_connected():
+                        log.info("P2P Override: WebRTC Data Channel is connected! Swapping transport...")
+                        self.use_webrtc = True
+                        # Safely close the relay server socket
+                        with self.serverSockLock:
+                            if self.relay_sock:
+                                self.relay_sock.close()
+                                self.relay_sock = None
+                                self.serverSock = None
+                        log.info("P2P Override: Relay socket closed. Direct WebRTC P2P channel is active.")
+                        try:
+                            p2p_webrtc.start_audio()
+                            log.info("P2P Override: Audio pipeline started successfully.")
+                        except Exception as e:
+                            log.error(f"P2P Override: Failed to start audio pipeline: {e}")
+                else:
+                    # Read from direct WebRTC Data Channel
+                    try:
+                        msg = p2p_webrtc.recv_message()
+                        if msg:
+                            # Append a newline because NVDA's deserializer expects lines
+                            line = (msg + "\n").encode("utf-8")
+                            self.parse(line)
+                        else:
+                            time.sleep(0.005) # Prevent CPU spinning
+                    except Exception as e:
+                        log.error(f"P2P Override: Error in WebRTC message polling: {e}")
+                        break
+                    
+                    # Check for disconnect
+                    if not p2p_webrtc.is_connected():
+                        log.warn("P2P Override: WebRTC Data Channel disconnected.")
+                        break
+
+                    # Periodically verify audio pipeline health (every 2 seconds)
+                    now = time.time()
+                    if now - last_audio_check > 2.0:
+                        last_audio_check = now
+                        try:
+                            if not p2p_webrtc.is_audio_active():
+                                log.warn("P2P Override: Audio pipeline inactive or has error. Restarting...")
+                                was_muted = p2p_webrtc.is_mic_muted()
+                                p2p_webrtc.stop_audio()
+                                p2p_webrtc.start_audio()
+                                p2p_webrtc.set_mic_muted(was_muted)
+                                log.info("P2P Override: Audio pipeline recovered successfully.")
+                        except Exception as e:
+                            log.error(f"P2P Override: Failed to recover audio pipeline: {e}")
+        finally:
+            log.info("P2P Override: Exited transport read loop. Cleaning up...")
+            self.connected = False
+            self.connectedEvent.clear()
+            self.transportDisconnected.notify()
+            self._disconnect()
+            try:
+                p2p_webrtc.stop_audio()
+            except Exception:
+                pass
+            p2p_webrtc.close()
 
     def send_to_relay(self, type, **kwargs):
         """Helper to send packets strictly to the relay server during signaling phase."""
@@ -234,6 +252,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         log.info("P2P Override: Installing monkey-patch for _remoteClient.client.RelayTransport...")
         _remoteClient.client.RelayTransport = P2PRelayTransport
 
+        # Register script_toggleMicrophone as a local script
+        try:
+            import _remoteClient
+            if _remoteClient._remoteClient is not None:
+                _remoteClient._remoteClient.registerLocalScript(self.script_toggleMicrophone)
+                log.info("P2P Override: Registered script_toggleMicrophone as a local script.")
+        except Exception as e:
+            log.error(f"P2P Override: Failed to register script_toggleMicrophone as a local script: {e}")
+
+    def terminate(self):
+        # Unregister local script
+        try:
+            import _remoteClient
+            if _remoteClient._remoteClient is not None:
+                _remoteClient._remoteClient.unregisterLocalScript(self.script_toggleMicrophone)
+                log.info("P2P Override: Unregistered script_toggleMicrophone local script.")
+        except Exception as e:
+            log.error(f"P2P Override: Failed to unregister script_toggleMicrophone local script: {e}")
+        super().terminate()
+
     def script_toggleMicrophone(self, gesture):
         if not webrtc_available:
             return
@@ -248,15 +286,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             new_mute = not current_mute
             p2p_webrtc.set_mic_muted(new_mute)
             
-            import winsound
             import ui
             if new_mute:
-                winsound.Beep(800, 100)
-                winsound.Beep(500, 150)
                 ui.message("Microphone muted")
             else:
-                winsound.Beep(500, 100)
-                winsound.Beep(800, 150)
                 ui.message("Microphone unmuted")
         except Exception as e:
             log.error(f"P2P Override: Error toggling microphone: {e}")
