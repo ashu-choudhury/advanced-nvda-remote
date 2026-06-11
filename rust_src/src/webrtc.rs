@@ -22,8 +22,10 @@ struct PeerState {
     peer_connection: Arc<RTCPeerConnection>,
     data_channel: Option<Arc<RTCDataChannel>>,
     audio_channel: Option<Arc<RTCDataChannel>>,
+    file_channel: Option<Arc<RTCDataChannel>>,
     local_candidates: Arc<Mutex<Vec<String>>>,
     received_messages: Arc<Mutex<VecDeque<String>>>,
+    received_file_messages: Arc<Mutex<VecDeque<String>>>,
     is_connected: Arc<Mutex<bool>>,
 }
 
@@ -48,13 +50,15 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
 
     let local_candidates = Arc::new(Mutex::new(Vec::new()));
     let received_messages = Arc::new(Mutex::new(VecDeque::new()));
+    let received_file_messages = Arc::new(Mutex::new(VecDeque::new()));
     let is_connected = Arc::new(Mutex::new(false));
 
     let local_candidates_clone = Arc::clone(&local_candidates);
     let received_messages_clone = Arc::clone(&received_messages);
+    let received_file_messages_clone = Arc::clone(&received_file_messages);
     let is_connected_clone = Arc::clone(&is_connected);
 
-    let (peer_connection, data_channel, audio_channel) = RUNTIME.block_on(async move {
+    let (peer_connection, data_channel, audio_channel, file_channel) = RUNTIME.block_on(async move {
         let m = MediaEngine::default();
         let api = APIBuilder::new()
             .with_media_engine(m)
@@ -72,20 +76,29 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             ..Default::default()
         };
 
-        let pc = Arc::new(api.new_peer_connection(config).await.expect("Failed to create PeerConnection"));
+        let pc = Arc::new(
+            api.new_peer_connection(config)
+                .await
+                .map_err(|e| format!("Failed to create PeerConnection: {:?}", e))?,
+        );
 
         let lc_clone = Arc::clone(&local_candidates_clone);
         pc.on_ice_candidate(Box::new(move |c| {
             if let Some(candidate) = c {
-                if let Ok(candidate_json) = serde_json::to_string(&candidate.to_json().unwrap()) {
-                    let mut lc = lc_clone.lock().unwrap();
-                    lc.push(candidate_json);
+                if let Ok(json_val) = candidate.to_json() {
+                    if let Ok(candidate_json) = serde_json::to_string(&json_val) {
+                        let mut lc = lc_clone.lock().unwrap();
+                        lc.push(candidate_json);
+                    }
                 }
             }
             Box::pin(async {})
         }));
 
-        let dc = pc.create_data_channel("nvda-remote", None).await.expect("Failed to create DataChannel");
+        let dc = pc
+            .create_data_channel("nvda-remote", None)
+            .await
+            .map_err(|e| format!("Failed to create DataChannel: {:?}", e))?;
         let dc_shared = Arc::clone(&dc);
 
         let ic_clone = Arc::clone(&is_connected_clone);
@@ -111,7 +124,11 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
-        let audio_dc = pc.create_data_channel("nvda-remote-audio", None).await.expect("Failed to create Audio Data Channel");
+        // Leader creates the audio data channel
+        let audio_dc = pc
+            .create_data_channel("nvda-remote-audio", None)
+            .await
+            .map_err(|e| format!("Failed to create Audio Data Channel: {:?}", e))?;
         let audio_dc_shared = Arc::clone(&audio_dc);
 
         audio_dc.on_message(Box::new(move |msg| {
@@ -136,15 +153,38 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
-        (pc, Some(dc_shared), Some(audio_dc_shared))
-    });
+        // Leader creates the file data channel
+        let file_dc = pc
+            .create_data_channel("nvda-remote-file", None)
+            .await
+            .map_err(|e| format!("Failed to create File Data Channel: {:?}", e))?;
+        let file_dc_shared = Arc::clone(&file_dc);
+
+        let rfm_clone = Arc::clone(&received_file_messages_clone);
+        file_dc.on_message(Box::new(move |msg| {
+            if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
+                let mut rfm = rfm_clone.lock().unwrap();
+                rfm.push_back(msg_str);
+            }
+            Box::pin(async {})
+        }));
+
+        Ok::<(Arc<RTCPeerConnection>, Option<Arc<RTCDataChannel>>, Option<Arc<RTCDataChannel>>, Option<Arc<RTCDataChannel>>), String>((
+            pc,
+            Some(dc_shared),
+            Some(audio_dc_shared),
+            Some(file_dc_shared),
+        ))
+    })?;
 
     *state_guard = Some(PeerState {
         peer_connection,
         data_channel,
         audio_channel,
+        file_channel,
         local_candidates,
         received_messages,
+        received_file_messages,
         is_connected,
     });
 
@@ -159,10 +199,12 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
 
     let local_candidates = Arc::new(Mutex::new(Vec::new()));
     let received_messages = Arc::new(Mutex::new(VecDeque::new()));
+    let received_file_messages = Arc::new(Mutex::new(VecDeque::new()));
     let is_connected = Arc::new(Mutex::new(false));
 
     let local_candidates_clone = Arc::clone(&local_candidates);
     let received_messages_clone = Arc::clone(&received_messages);
+    let received_file_messages_clone = Arc::clone(&received_file_messages);
     let is_connected_clone = Arc::clone(&is_connected);
 
     let pc = RUNTIME.block_on(async move {
@@ -183,14 +225,20 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
             ..Default::default()
         };
 
-        let pc = Arc::new(api.new_peer_connection(config).await.expect("Failed to create PeerConnection"));
+        let pc = Arc::new(
+            api.new_peer_connection(config)
+                .await
+                .map_err(|e| format!("Failed to create PeerConnection: {:?}", e))?,
+        );
 
         let lc_clone = Arc::clone(&local_candidates_clone);
         pc.on_ice_candidate(Box::new(move |c| {
             if let Some(candidate) = c {
-                if let Ok(candidate_json) = serde_json::to_string(&candidate.to_json().unwrap()) {
-                    let mut lc = lc_clone.lock().unwrap();
-                    lc.push(candidate_json);
+                if let Ok(json_val) = candidate.to_json() {
+                    if let Ok(candidate_json) = serde_json::to_string(&json_val) {
+                        let mut lc = lc_clone.lock().unwrap();
+                        lc.push(candidate_json);
+                    }
                 }
             }
             Box::pin(async {})
@@ -232,6 +280,21 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                 if let Some(ref mut state) = *state_guard {
                     state.audio_channel = Some(audio_dc);
                 }
+            } else if label == "nvda-remote-file" {
+                let file_dc = Arc::clone(&dc);
+                let rfm_clone = Arc::clone(&received_file_messages_clone);
+                file_dc.on_message(Box::new(move |msg| {
+                    if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
+                        let mut rfm = rfm_clone.lock().unwrap();
+                        rfm.push_back(msg_str);
+                    }
+                    Box::pin(async {})
+                }));
+
+                let mut state_guard = STATE.lock().unwrap();
+                if let Some(ref mut state) = *state_guard {
+                    state.file_channel = Some(file_dc);
+                }
             } else {
                 dc.on_open(Box::new(move || {
                     let mut ic = ic_open.lock().unwrap();
@@ -253,6 +316,7 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                     Box::pin(async {})
                 }));
 
+                // Store the data channel
                 let mut state_guard = STATE.lock().unwrap();
                 if let Some(ref mut state) = *state_guard {
                     state.data_channel = Some(dc);
@@ -262,15 +326,17 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
-        pc
-    });
+        Ok::<Arc<RTCPeerConnection>, String>(pc)
+    })?;
 
     *state_guard = Some(PeerState {
         peer_connection: pc,
         data_channel: None,
         audio_channel: None,
+        file_channel: None,
         local_candidates,
         received_messages,
+        received_file_messages,
         is_connected,
     });
 
@@ -282,11 +348,14 @@ pub fn create_offer() -> Result<String, String> {
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
         let offer = RUNTIME.block_on(async move {
-            let offer = pc.create_offer(None).await.expect("Failed to create offer");
-            pc.set_local_description(offer.clone()).await.expect("Failed to set local description");
-            offer
-        });
-        let sdp_json = serde_json::to_string(&offer).unwrap();
+            let offer = pc.create_offer(None).await
+                .map_err(|e| format!("Failed to create offer: {:?}", e))?;
+            pc.set_local_description(offer.clone()).await
+                .map_err(|e| format!("Failed to set local description: {:?}", e))?;
+            Ok::<RTCSessionDescription, String>(offer)
+        })?;
+        let sdp_json = serde_json::to_string(&offer)
+            .map_err(|e| format!("Failed to serialize offer: {:?}", e))?;
         Ok(sdp_json)
     } else {
         Err("PeerConnection not initialized".to_string())
@@ -297,10 +366,12 @@ pub fn set_offer(offer_json: String) -> Result<(), String> {
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
-        let offer: RTCSessionDescription = serde_json::from_str(&offer_json).unwrap();
+        let offer: RTCSessionDescription = serde_json::from_str(&offer_json)
+            .map_err(|e| format!("Failed to parse offer JSON: {:?}", e))?;
         RUNTIME.block_on(async move {
-            pc.set_remote_description(offer).await.expect("Failed to set remote description");
-        });
+            pc.set_remote_description(offer).await
+                .map_err(|e| format!("Failed to set remote description: {:?}", e))
+        })?;
         Ok(())
     } else {
         Err("PeerConnection not initialized".to_string())
@@ -312,11 +383,14 @@ pub fn create_answer() -> Result<String, String> {
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
         let answer = RUNTIME.block_on(async move {
-            let answer = pc.create_answer(None).await.expect("Failed to create answer");
-            pc.set_local_description(answer.clone()).await.expect("Failed to set local description");
-            answer
-        });
-        let sdp_json = serde_json::to_string(&answer).unwrap();
+            let answer = pc.create_answer(None).await
+                .map_err(|e| format!("Failed to create answer: {:?}", e))?;
+            pc.set_local_description(answer.clone()).await
+                .map_err(|e| format!("Failed to set local description: {:?}", e))?;
+            Ok::<RTCSessionDescription, String>(answer)
+        })?;
+        let sdp_json = serde_json::to_string(&answer)
+            .map_err(|e| format!("Failed to serialize answer: {:?}", e))?;
         Ok(sdp_json)
     } else {
         Err("PeerConnection not initialized".to_string())
@@ -327,10 +401,12 @@ pub fn set_answer(answer_json: String) -> Result<(), String> {
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
-        let answer: RTCSessionDescription = serde_json::from_str(&answer_json).unwrap();
+        let answer: RTCSessionDescription = serde_json::from_str(&answer_json)
+            .map_err(|e| format!("Failed to parse answer JSON: {:?}", e))?;
         RUNTIME.block_on(async move {
-            pc.set_remote_description(answer).await.expect("Failed to set remote description");
-        });
+            pc.set_remote_description(answer).await
+                .map_err(|e| format!("Failed to set remote description: {:?}", e))
+        })?;
         Ok(())
     } else {
         Err("PeerConnection not initialized".to_string())
@@ -341,10 +417,12 @@ pub fn add_ice_candidate(candidate_json: String) -> Result<(), String> {
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
-        let candidate: RTCIceCandidateInit = serde_json::from_str(&candidate_json).unwrap();
+        let candidate: RTCIceCandidateInit = serde_json::from_str(&candidate_json)
+            .map_err(|e| format!("Failed to parse ICE candidate JSON: {:?}", e))?;
         RUNTIME.block_on(async move {
-            pc.add_ice_candidate(candidate).await.expect("Failed to add remote ICE candidate");
-        });
+            pc.add_ice_candidate(candidate).await
+                .map_err(|e| format!("Failed to add remote ICE candidate: {:?}", e))
+        })?;
         Ok(())
     } else {
         Err("PeerConnection not initialized".to_string())
@@ -501,6 +579,42 @@ pub fn is_audio_active() -> Result<bool, String> {
         } else {
             Ok(false)
         }
+    } else {
+        Ok(false)
+    }
+}
+
+pub fn send_file_message(msg: String) -> Result<bool, String> {
+    let state_guard = STATE.lock().unwrap();
+    if let Some(ref state) = *state_guard {
+        if let Some(ref dc) = state.file_channel {
+            let dc_clone = Arc::clone(dc);
+            let success = RUNTIME.block_on(async move {
+                dc_clone.send_text(msg).await.is_ok()
+            });
+            Ok(success)
+        } else {
+            Ok(false)
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+pub fn recv_file_message() -> Result<Option<String>, String> {
+    let state_guard = STATE.lock().unwrap();
+    if let Some(ref state) = *state_guard {
+        let mut rfm = state.received_file_messages.lock().unwrap();
+        Ok(rfm.pop_front())
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn has_file_channel() -> Result<bool, String> {
+    let state_guard = STATE.lock().unwrap();
+    if let Some(ref state) = *state_guard {
+        Ok(state.file_channel.is_some())
     } else {
         Ok(false)
     }

@@ -4,6 +4,11 @@ import subprocess
 import shutil
 import platform
 import struct
+import argparse
+
+# Add current directory to path for package_addon import
+sys.path.append(os.path.dirname(__file__))
+import package_addon
 
 # Force the Rust cmake crate to use our wrapper script
 os.environ["CMAKE"] = os.path.abspath("cmake_wrapper.bat")
@@ -56,13 +61,10 @@ def compile_and_copy():
     shutil.copy2(dll_path, dest_path)
 
 def package():
-    # Import and run package function from package_addon.py
-    sys.path.append(os.path.dirname(__file__))
-    import package_addon
+    # Run package function from package_addon.py
     package_addon.package()
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description="Build and package advanced-nvda-remote add-on")
     parser.add_argument("--test", action="store_true", help="Run the Rust test suite")
     args = parser.parse_args()

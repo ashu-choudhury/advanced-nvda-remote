@@ -7,6 +7,8 @@ import time
 import socket
 import select
 import globalPluginHandler
+import json
+from . import p2p_file_transfer
 from logHandler import log
 
 def get_architecture_folder():
@@ -24,7 +26,7 @@ def get_architecture_folder():
         return "x64"
 
 # Inject the architecture-specific lib folder into sys.path
-addon_root = os.path.dirname(os.path.dirname(__file__))
+addon_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 arch_folder = get_architecture_folder()
 lib_dir = os.path.join(addon_root, "lib", arch_folder)
 if lib_dir not in sys.path:
@@ -43,6 +45,8 @@ except ImportError as e:
     webrtc_available = False
     log.error(f"P2P Override: Failed to load native WebRTC module: {e}")
 
+import ui
+import _remoteClient
 import _remoteClient.client
 from _remoteClient.transport import RelayTransport
 from _remoteClient.protocol import RemoteMessageType
@@ -54,6 +58,7 @@ class P2PRelayTransport(RelayTransport):
         self.relay_sock = None
         self.sig_candidates_sent = set()
         self.webrtc_started = False
+        self.file_receiver = None
 
     def initiate_webrtc(self):
         if self.webrtc_started:
@@ -163,6 +168,14 @@ class P2PRelayTransport(RelayTransport):
                         log.warn("P2P Override: WebRTC Data Channel disconnected.")
                         break
 
+                    # Read from direct file channel
+                    try:
+                        file_msg = p2p_webrtc.recv_file_message()
+                        if file_msg:
+                            self.parse_file_message(file_msg)
+                    except Exception as e:
+                        log.error(f"P2P Override: Error in WebRTC file message polling: {e}")
+
                     # Periodically verify audio pipeline health (every 2 seconds)
                     now = time.time()
                     if now - last_audio_check > 2.0:
@@ -187,6 +200,9 @@ class P2PRelayTransport(RelayTransport):
                 p2p_webrtc.stop_audio()
             except Exception:
                 pass
+            if hasattr(self, "file_receiver") and self.file_receiver:
+                self.file_receiver.cleanup()
+                self.file_receiver = None
             p2p_webrtc.close()
 
     def send_to_relay(self, type, **kwargs):
@@ -244,6 +260,31 @@ class P2PRelayTransport(RelayTransport):
             log.error(f"P2P Override: Error handling signaling packet: {e}")
         super().parse(line)
 
+    def parse_file_message(self, msg_str):
+        try:
+            obj = json.loads(msg_str)
+            msg_type = obj.get("type")
+            if msg_type == "p2p_file_start":
+                filename = obj.get("filename")
+                size = obj.get("size")
+                is_zip = obj.get("is_zip", False)
+                self.file_receiver = p2p_file_transfer.FileReceiver()
+                self.file_receiver.start(filename, size, is_zip)
+            elif msg_type == "p2p_file_chunk":
+                data = obj.get("data")
+                if hasattr(self, "file_receiver") and self.file_receiver:
+                    self.file_receiver.write_chunk(data)
+            elif msg_type == "p2p_file_end":
+                if hasattr(self, "file_receiver") and self.file_receiver:
+                    self.file_receiver.finalize()
+                    self.file_receiver = None
+            elif msg_type == "p2p_file_abort":
+                if hasattr(self, "file_receiver") and self.file_receiver:
+                    self.file_receiver.abort()
+                    self.file_receiver = None
+        except Exception as e:
+            log.error(f"P2P Override: Error parsing file message: {e}")
+
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def __init__(self):
@@ -254,22 +295,50 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
         # Register script_toggleMicrophone as a local script
         try:
-            import _remoteClient
             if _remoteClient._remoteClient is not None:
                 _remoteClient._remoteClient.registerLocalScript(self.script_toggleMicrophone)
                 log.info("P2P Override: Registered script_toggleMicrophone as a local script.")
         except Exception as e:
             log.error(f"P2P Override: Failed to register script_toggleMicrophone as a local script: {e}")
 
+        # Monkey-patch pushClipboard to support file transfer
+        try:
+            self.original_pushClipboard = _remoteClient.client.RemoteClient.pushClipboard
+            
+            def patched_pushClipboard(client_inst):
+                files = p2p_file_transfer.get_files_from_clipboard()
+                if files:
+                    transport = client_inst.followerTransport or client_inst.leaderTransport
+                    if transport and getattr(transport, "use_webrtc", False) and p2p_webrtc.has_file_channel():
+                        sender = p2p_file_transfer.FileSenderThread(files, p2p_webrtc.send_file_message)
+                        sender.start()
+                    else:
+                        self.original_pushClipboard(client_inst)
+                else:
+                    self.original_pushClipboard(client_inst)
+                    
+            _remoteClient.client.RemoteClient.pushClipboard = patched_pushClipboard
+            log.info("P2P Override: Monkey-patched RemoteClient.pushClipboard for file transfers.")
+        except Exception as e:
+            log.error(f"P2P Override: Failed to patch pushClipboard: {e}")
+
     def terminate(self):
         # Unregister local script
         try:
-            import _remoteClient
             if _remoteClient._remoteClient is not None:
                 _remoteClient._remoteClient.unregisterLocalScript(self.script_toggleMicrophone)
                 log.info("P2P Override: Unregistered script_toggleMicrophone local script.")
         except Exception as e:
             log.error(f"P2P Override: Failed to unregister script_toggleMicrophone local script: {e}")
+
+        # Restore original pushClipboard
+        try:
+            if hasattr(self, "original_pushClipboard"):
+                _remoteClient.client.RemoteClient.pushClipboard = self.original_pushClipboard
+                log.info("P2P Override: Restored original RemoteClient.pushClipboard.")
+        except Exception as e:
+            log.error(f"P2P Override: Failed to restore pushClipboard: {e}")
+
         super().terminate()
 
     def script_toggleMicrophone(self, gesture):
@@ -278,7 +347,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         
         try:
             if not p2p_webrtc.is_connected():
-                import ui
                 ui.message("Not connected to a P2P remote session")
                 return
             
@@ -286,7 +354,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             new_mute = not current_mute
             p2p_webrtc.set_mic_muted(new_mute)
             
-            import ui
             if new_mute:
                 ui.message("Microphone muted")
             else:
