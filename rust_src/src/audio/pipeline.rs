@@ -6,11 +6,7 @@ use sonora::AudioProcessing;
 use tokio::sync::mpsc::UnboundedSender;
 use crate::audio::jitter::JitterBuffer;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct AudioPacket {
-    pub stream_id: u8, // 0 = Microphone
-    pub payload: Vec<u8>,
-}
+// We no longer use a structured AudioPacket struct; data is serialized as a raw binary packet: [stream_id, ...payload]
 
 // Thread-safe wrapper for cpal::Stream (specifically WASAPI raw COM pointers on Windows)
 pub struct SendStream(pub cpal::Stream);
@@ -19,13 +15,15 @@ unsafe impl Sync for SendStream {}
 
 #[allow(dead_code)]
 pub struct AudioPipeline {
-    input_stream: SendStream,
-    output_stream: SendStream,
-    loopback_stream: SendStream,
+    pub input_stream: Option<SendStream>,
+    pub output_stream: Option<SendStream>,
+    pub loopback_stream: Option<SendStream>,
     pub is_muted: Arc<Mutex<bool>>,
     pub jitter_buffer: Arc<Mutex<JitterBuffer>>,
     pub apm: Arc<Mutex<AudioProcessing>>,
     pub has_error: Arc<Mutex<bool>>,
+    pub input_device_name: String,
+    pub output_device_name: String,
 }
 
 impl AudioPipeline {
@@ -36,6 +34,8 @@ impl AudioPipeline {
         apm: Arc<Mutex<AudioProcessing>>,
     ) -> Result<Self, String> {
         let (input_device, output_device) = super::device::get_devices()?;
+        let input_device_name = input_device.name().unwrap_or_else(|_| "Unknown".to_string());
+        let output_device_name = output_device.name().unwrap_or_else(|_| "Unknown".to_string());
         let input_stream_config = super::device::resolve_input_config(&input_device)?;
         let output_stream_config = super::device::resolve_output_config(&output_device)?;
 
@@ -151,15 +151,11 @@ impl AudioPipeline {
                     if let Ok(len) = encoder.encode_float(&processed, &mut opus_payload) {
                         opus_payload.truncate(len);
 
-                        // Wrap in stream structure
-                        let packet = AudioPacket {
-                            stream_id: 0,
-                            payload: opus_payload,
-                        };
-
-                        if let Ok(serialized) = serde_json::to_vec(&packet) {
-                            let _ = tx.send(serialized);
-                        }
+                        // Prepend 1-byte stream_id (0 = Microphone) to raw Opus payload
+                        let mut serialized = Vec::with_capacity(1 + opus_payload.len());
+                        serialized.push(0);
+                        serialized.extend_from_slice(&opus_payload);
+                        let _ = tx.send(serialized);
                     }
                 }
             },
@@ -211,13 +207,15 @@ impl AudioPipeline {
         loopback_stream.play().map_err(|e| format!("Failed to start loopback stream: {:?}", e))?;
 
         Ok(Self {
-            input_stream: SendStream(input_stream),
-            output_stream: SendStream(output_stream),
-            loopback_stream: SendStream(loopback_stream),
+            input_stream: Some(SendStream(input_stream)),
+            output_stream: Some(SendStream(output_stream)),
+            loopback_stream: Some(SendStream(loopback_stream)),
             is_muted,
             jitter_buffer,
             apm,
             has_error,
+            input_device_name,
+            output_device_name,
         })
     }
 }

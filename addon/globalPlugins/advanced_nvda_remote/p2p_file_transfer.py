@@ -99,6 +99,11 @@ class FileSenderThread(threading.Thread):
         self.send_fn = send_fn
         self.daemon = True
         self.cancelled = False
+        self.bytes_sent = 0
+        self.bytes_acked = 0
+
+    def handle_ack(self, num_bytes):
+        self.bytes_acked += num_bytes
 
     def run(self):
         try:
@@ -170,11 +175,16 @@ class FileSenderThread(threading.Thread):
 
             # Send chunks with stream compression
             chunk_size = 262144 # 256KB
-            bytes_sent = 0
+            self.bytes_sent = 0
+            self.bytes_acked = 0
             last_reported_percent = 0
 
             with open(source_path, "rb") as f:
-                while bytes_sent < file_size and not self.cancelled:
+                while self.bytes_sent < file_size and not self.cancelled:
+                    # Flow control: wait if we have sent more than 1MB ahead of the receiver's disk writes
+                    while self.bytes_sent - self.bytes_acked > 1024 * 1024 and not self.cancelled:
+                        time.sleep(0.01)
+
                     chunk = f.read(chunk_size)
                     if not chunk:
                         break
@@ -189,8 +199,8 @@ class FileSenderThread(threading.Thread):
                     }
                     self.send_fn(json.dumps(chunk_payload))
 
-                    bytes_sent += len(chunk)
-                    percent = int((bytes_sent / file_size) * 100)
+                    self.bytes_sent += len(chunk)
+                    percent = int((self.bytes_sent / file_size) * 100)
                     if percent // 10 > last_reported_percent // 10:
                         last_reported_percent = percent
                         wx.CallAfter(ui.message, f"Uploading: {percent}%")
@@ -261,6 +271,8 @@ class FileReceiver:
                 self.last_reported_percent = percent
                 wx.CallAfter(ui.message, f"Downloading: {percent}%")
                 wx.CallAfter(tones.playTone, 550, 30)
+
+        return len(chunk)
 
     def finalize(self):
         if self.file_handle:

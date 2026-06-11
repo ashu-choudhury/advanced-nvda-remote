@@ -84,6 +84,11 @@ fn is_audio_active() -> PyResult<bool> {
 }
 
 #[pyfunction]
+fn check_default_devices_changed() -> PyResult<bool> {
+    webrtc::check_default_devices_changed().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+}
+
+#[pyfunction]
 fn send_file_message(msg: String) -> PyResult<bool> {
     webrtc::send_file_message(msg).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
@@ -121,6 +126,7 @@ fn p2p_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_mic_muted, m)?)?;
     m.add_function(wrap_pyfunction!(is_mic_muted, m)?)?;
     m.add_function(wrap_pyfunction!(is_audio_active, m)?)?;
+    m.add_function(wrap_pyfunction!(check_default_devices_changed, m)?)?;
     m.add_function(wrap_pyfunction!(send_file_message, m)?)?;
     m.add_function(wrap_pyfunction!(recv_file_message, m)?)?;
     m.add_function(wrap_pyfunction!(has_file_channel, m)?)?;

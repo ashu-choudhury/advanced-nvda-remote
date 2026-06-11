@@ -59,6 +59,7 @@ class P2PRelayTransport(RelayTransport):
         self.sig_candidates_sent = set()
         self.webrtc_started = False
         self.file_receiver = None
+        self.file_sender = None
 
     def initiate_webrtc(self):
         if self.webrtc_started:
@@ -157,8 +158,6 @@ class P2PRelayTransport(RelayTransport):
                             # Append a newline because NVDA's deserializer expects lines
                             line = (msg + "\n").encode("utf-8")
                             self.parse(line)
-                        else:
-                            time.sleep(0.005) # Prevent CPU spinning
                     except Exception as e:
                         log.error(f"P2P Override: Error in WebRTC message polling: {e}")
                         break
@@ -181,8 +180,8 @@ class P2PRelayTransport(RelayTransport):
                     if now - last_audio_check > 2.0:
                         last_audio_check = now
                         try:
-                            if not p2p_webrtc.is_audio_active():
-                                log.warn("P2P Override: Audio pipeline inactive or has error. Restarting...")
+                            if not p2p_webrtc.is_audio_active() or p2p_webrtc.check_default_devices_changed():
+                                log.warn("P2P Override: Audio pipeline inactive or default audio devices changed. Restarting...")
                                 was_muted = p2p_webrtc.is_mic_muted()
                                 p2p_webrtc.stop_audio()
                                 p2p_webrtc.start_audio()
@@ -273,7 +272,16 @@ class P2PRelayTransport(RelayTransport):
             elif msg_type == "p2p_file_chunk":
                 data = obj.get("data")
                 if hasattr(self, "file_receiver") and self.file_receiver:
-                    self.file_receiver.write_chunk(data)
+                    chunk_len = self.file_receiver.write_chunk(data)
+                    # Send ACK back to the sender
+                    ack_payload = {
+                        "type": "p2p_file_ack",
+                        "bytes": chunk_len
+                    }
+                    p2p_webrtc.send_file_message(json.dumps(ack_payload))
+            elif msg_type == "p2p_file_ack":
+                if hasattr(self, "file_sender") and self.file_sender:
+                    self.file_sender.handle_ack(obj.get("bytes", 0))
             elif msg_type == "p2p_file_end":
                 if hasattr(self, "file_receiver") and self.file_receiver:
                     self.file_receiver.finalize()
@@ -311,6 +319,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     transport = client_inst.followerTransport or client_inst.leaderTransport
                     if transport and getattr(transport, "use_webrtc", False) and p2p_webrtc.has_file_channel():
                         sender = p2p_file_transfer.FileSenderThread(files, p2p_webrtc.send_file_message)
+                        transport.file_sender = sender
                         sender.start()
                     else:
                         self.original_pushClipboard(client_inst)
