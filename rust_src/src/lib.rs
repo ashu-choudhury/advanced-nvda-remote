@@ -1,3 +1,5 @@
+pub mod audio;
+
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 use once_cell::sync::Lazy;
@@ -11,6 +13,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use pyo3::prelude::*;
+use bytes::Bytes;
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
@@ -19,10 +22,22 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 struct PeerState {
     peer_connection: Arc<RTCPeerConnection>,
     data_channel: Option<Arc<RTCDataChannel>>,
+    audio_channel: Option<Arc<RTCDataChannel>>,
     local_candidates: Arc<Mutex<Vec<String>>>,
     received_messages: Arc<Mutex<VecDeque<String>>>,
     is_connected: Arc<Mutex<bool>>,
 }
+
+struct AudioState {
+    pipeline: audio::AudioPipeline,
+    audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    jitter_buffer: Arc<Mutex<audio::JitterBuffer>>,
+    apm: Arc<Mutex<sonora::AudioProcessing>>,
+    is_muted: Arc<Mutex<bool>>,
+    decoder: Arc<Mutex<opus::Decoder>>,
+}
+
+static AUDIO_STATE: Lazy<Mutex<Option<AudioState>>> = Lazy::new(|| Mutex::new(None));
 
 static STATE: Lazy<Mutex<Option<PeerState>>> = Lazy::new(|| Mutex::new(None));
 
@@ -41,7 +56,7 @@ fn init_leader(stun_servers: Vec<String>) -> PyResult<()> {
     let received_messages_clone = Arc::clone(&received_messages);
     let is_connected_clone = Arc::clone(&is_connected);
 
-    let (peer_connection, data_channel) = RUNTIME.block_on(async move {
+    let (peer_connection, data_channel, audio_channel) = RUNTIME.block_on(async move {
         let m = MediaEngine::default();
         let api = APIBuilder::new()
             .with_media_engine(m)
@@ -100,12 +115,48 @@ fn init_leader(stun_servers: Vec<String>) -> PyResult<()> {
             Box::pin(async {})
         }));
 
-        (pc, Some(dc_shared))
+        // Leader creates the audio data channel
+        let audio_dc = pc.create_data_channel("nvda-remote-audio", None).await.expect("Failed to create Audio Data Channel");
+        let audio_dc_shared = Arc::clone(&audio_dc);
+
+        audio_dc.on_message(Box::new(move |msg| {
+            let data = msg.data.clone();
+            let audio_state_guard = AUDIO_STATE.lock().unwrap();
+            if let Some(ref audio_state) = *audio_state_guard {
+                let decoder = Arc::clone(&audio_state.decoder);
+                let apm = Arc::clone(&audio_state.apm);
+                let jb = Arc::clone(&audio_state.jitter_buffer);
+                RUNTIME.spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(packet) = serde_json::from_slice::<audio::AudioPacket>(&data) {
+                            if packet.stream_id == 0 {
+                                let mut dec = decoder.lock().unwrap();
+                                let mut decoded = vec![0.0f32; 480];
+                                if let Ok(len) = dec.decode_float(&packet.payload, &mut decoded, false) {
+                                    decoded.truncate(len);
+                                    {
+                                        let mut apm_lock = apm.lock().unwrap();
+                                        let mut render_out = decoded.clone();
+                                        let _ = apm_lock.process_render_f32(&[&decoded], &mut [&mut render_out]);
+                                    }
+                                    let mut jb_lock = jb.lock().unwrap();
+                                    jb_lock.push(&decoded);
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            Box::pin(async {})
+        }));
+
+        (pc, Some(dc_shared), Some(audio_dc_shared))
     });
 
     *state_guard = Some(PeerState {
         peer_connection,
         data_channel,
+        audio_channel,
         local_candidates,
         received_messages,
         is_connected,
@@ -166,33 +217,74 @@ fn init_follower(stun_servers: Vec<String>) -> PyResult<()> {
         let ic_clone = Arc::clone(&is_connected_clone);
         let rm_clone = Arc::clone(&received_messages_clone);
         pc.on_data_channel(Box::new(move |dc| {
+            let label = dc.label().to_string();
             let ic_open = Arc::clone(&ic_clone);
-            dc.on_open(Box::new(move || {
-                let mut ic = ic_open.lock().unwrap();
-                *ic = true;
-                Box::pin(async {})
-            }));
-
             let ic_close = Arc::clone(&ic_clone);
-            dc.on_close(Box::new(move || {
-                let mut ic = ic_close.lock().unwrap();
-                *ic = false;
-                Box::pin(async {})
-            }));
-
             let rm_msg = Arc::clone(&rm_clone);
-            dc.on_message(Box::new(move |msg| {
-                if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
-                    let mut rm = rm_msg.lock().unwrap();
-                    rm.push_back(msg_str);
-                }
-                Box::pin(async {})
-            }));
 
-            // Store the data channel
-            let mut state_guard = STATE.lock().unwrap();
-            if let Some(ref mut state) = *state_guard {
-                state.data_channel = Some(dc);
+            if label == "nvda-remote-audio" {
+                let audio_dc = Arc::clone(&dc);
+                audio_dc.on_message(Box::new(move |msg| {
+                    let data = msg.data.clone();
+                    let audio_state_guard = AUDIO_STATE.lock().unwrap();
+                    if let Some(ref audio_state) = *audio_state_guard {
+                        let decoder = Arc::clone(&audio_state.decoder);
+                        let apm = Arc::clone(&audio_state.apm);
+                        let jb = Arc::clone(&audio_state.jitter_buffer);
+                        RUNTIME.spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(packet) = serde_json::from_slice::<audio::AudioPacket>(&data) {
+                                    if packet.stream_id == 0 {
+                                        let mut dec = decoder.lock().unwrap();
+                                        let mut decoded = vec![0.0f32; 480];
+                                        if let Ok(len) = dec.decode_float(&packet.payload, &mut decoded, false) {
+                                            decoded.truncate(len);
+                                            {
+                                                let mut apm_lock = apm.lock().unwrap();
+                                                let mut render_out = decoded.clone();
+                                                let _ = apm_lock.process_render_f32(&[&decoded], &mut [&mut render_out]);
+                                            }
+                                            let mut jb_lock = jb.lock().unwrap();
+                                            jb_lock.push(&decoded);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    Box::pin(async {})
+                }));
+
+                let mut state_guard = STATE.lock().unwrap();
+                if let Some(ref mut state) = *state_guard {
+                    state.audio_channel = Some(audio_dc);
+                }
+            } else {
+                dc.on_open(Box::new(move || {
+                    let mut ic = ic_open.lock().unwrap();
+                    *ic = true;
+                    Box::pin(async {})
+                }));
+
+                dc.on_close(Box::new(move || {
+                    let mut ic = ic_close.lock().unwrap();
+                    *ic = false;
+                    Box::pin(async {})
+                }));
+
+                dc.on_message(Box::new(move |msg| {
+                    if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
+                        let mut rm = rm_msg.lock().unwrap();
+                        rm.push_back(msg_str);
+                    }
+                    Box::pin(async {})
+                }));
+
+                // Store the data channel
+                let mut state_guard = STATE.lock().unwrap();
+                if let Some(ref mut state) = *state_guard {
+                    state.data_channel = Some(dc);
+                }
             }
 
             Box::pin(async {})
@@ -204,6 +296,7 @@ fn init_follower(stun_servers: Vec<String>) -> PyResult<()> {
     *state_guard = Some(PeerState {
         peer_connection: pc,
         data_channel: None,
+        audio_channel: None,
         local_candidates,
         received_messages,
         is_connected,
@@ -345,7 +438,108 @@ fn is_connected() -> PyResult<bool> {
 }
 
 #[pyfunction]
+fn start_audio() -> PyResult<()> {
+    let mut audio_state_guard = AUDIO_STATE.lock().unwrap();
+    if audio_state_guard.is_some() {
+        return Ok(());
+    }
+
+    let state_guard = STATE.lock().unwrap();
+    let audio_channel = if let Some(ref state) = *state_guard {
+        if let Some(ref ac) = state.audio_channel {
+            Arc::clone(ac)
+        } else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Audio Data Channel not available"));
+        }
+    } else {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("PeerConnection not initialized"));
+    };
+
+    let is_muted = Arc::new(Mutex::new(false));
+    let jitter_buffer = Arc::new(Mutex::new(audio::JitterBuffer::new(2880))); // 60ms target
+
+    // Sonora APM setup
+    let config = sonora::Config {
+        echo_canceller: Some(sonora::config::EchoCanceller::default()),
+        noise_suppression: Some(sonora::config::NoiseSuppression::default()),
+        gain_controller2: Some(sonora::config::GainController2::default()),
+        ..Default::default()
+    };
+    let apm = sonora::AudioProcessing::builder()
+        .config(config)
+        .capture_config(sonora::StreamConfig::new(48000, 1))
+        .render_config(sonora::StreamConfig::new(48000, 1))
+        .build();
+    let apm = Arc::new(Mutex::new(apm));
+
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let pipeline = audio::AudioPipeline::new(
+        audio_tx.clone(),
+        Arc::clone(&is_muted),
+        Arc::clone(&jitter_buffer),
+        Arc::clone(&apm),
+    ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    // Spawn async task to send audio data
+    let audio_channel_clone = Arc::clone(&audio_channel);
+    RUNTIME.spawn(async move {
+        while let Some(data) = audio_rx.recv().await {
+            let _ = audio_channel_clone.send(&Bytes::from(data)).await;
+        }
+    });
+
+    let decoder = Arc::new(Mutex::new(
+        opus::Decoder::new(48000, opus::Channels::Mono)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Decoder init failed: {:?}", e)))?
+    ));
+
+    *audio_state_guard = Some(AudioState {
+        pipeline,
+        audio_tx,
+        jitter_buffer,
+        apm,
+        is_muted,
+        decoder,
+    });
+
+    Ok(())
+}
+
+#[pyfunction]
+fn stop_audio() -> PyResult<()> {
+    let mut audio_state_guard = AUDIO_STATE.lock().unwrap();
+    *audio_state_guard = None;
+    Ok(())
+}
+
+#[pyfunction]
+fn set_mic_muted(muted: bool) -> PyResult<()> {
+    let audio_state_guard = AUDIO_STATE.lock().unwrap();
+    if let Some(ref audio_state) = *audio_state_guard {
+        let mut is_muted = audio_state.is_muted.lock().unwrap();
+        *is_muted = muted;
+    }
+    Ok(())
+}
+
+#[pyfunction]
+fn is_mic_muted() -> PyResult<bool> {
+    let audio_state_guard = AUDIO_STATE.lock().unwrap();
+    if let Some(ref audio_state) = *audio_state_guard {
+        let is_muted = audio_state.is_muted.lock().unwrap();
+        Ok(*is_muted)
+    } else {
+        Ok(true) // Default to muted if audio not started
+    }
+}
+
+#[pyfunction]
 fn close() -> PyResult<()> {
+    // Stop the audio first
+    let mut audio_state_guard = AUDIO_STATE.lock().unwrap();
+    *audio_state_guard = None;
+
     let mut state_guard = STATE.lock().unwrap();
     if let Some(state) = state_guard.take() {
         let pc = state.peer_connection;
@@ -369,6 +563,10 @@ fn p2p_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(send_message, m)?)?;
     m.add_function(wrap_pyfunction!(recv_message, m)?)?;
     m.add_function(wrap_pyfunction!(is_connected, m)?)?;
+    m.add_function(wrap_pyfunction!(start_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(stop_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(set_mic_muted, m)?)?;
+    m.add_function(wrap_pyfunction!(is_mic_muted, m)?)?;
     m.add_function(wrap_pyfunction!(close, m)?)?;
     Ok(())
 }

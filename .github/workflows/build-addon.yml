@@ -1,0 +1,71 @@
+name: Build and Package NVDA Add-on
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      # Bypass CMake deprecation policy warning for older crates like audiopus_sys
+      CMAKE_VAR_CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust_src -> target"
+
+    - name: Build Rust WebRTC binary
+      run: |
+        cd rust_src
+        cargo build --release
+
+    - name: Copy release binary to addon lib folder
+      run: |
+        # Create lib folder if it doesn't exist
+        New-Item -ItemType Directory -Force -Path addon/lib
+        # Copy and rename DLL to PYD
+        Copy-Item -Force rust_src/target/release/p2p_webrtc.dll addon/lib/p2p_webrtc.pyd
+
+    - name: Package NVDA Add-on
+      run: |
+        python package_addon.py
+
+    - name: Upload Packaged Add-on Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: advanced-nvda-remote-addon
+        path: advanced-nvda-remote.nvda-addon
+        if-no-files-found: error
+
+    - name: Create GitHub Release and Upload Asset
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: advanced-nvda-remote.nvda-addon
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

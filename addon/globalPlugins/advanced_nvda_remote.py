@@ -114,6 +114,11 @@ class P2PRelayTransport(RelayTransport):
                             self.relay_sock = None
                             self.serverSock = None
                     log.info("P2P Override: Relay socket closed. Direct WebRTC P2P channel is active.")
+                    try:
+                        p2p_webrtc.start_audio()
+                        log.info("P2P Override: Audio pipeline started successfully.")
+                    except Exception as e:
+                        log.error(f"P2P Override: Failed to start audio pipeline: {e}")
             else:
                 # Read from direct WebRTC Data Channel
                 try:
@@ -138,6 +143,10 @@ class P2PRelayTransport(RelayTransport):
         self.connectedEvent.clear()
         self.transportDisconnected.notify()
         self._disconnect()
+        try:
+            p2p_webrtc.stop_audio()
+        except Exception:
+            pass
         p2p_webrtc.close()
 
     def send_to_relay(self, type, **kwargs):
@@ -202,3 +211,38 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Overwrite the built-in transport with our P2P WebRTC transport subclass!
         log.info("P2P Override: Installing monkey-patch for _remoteClient.client.RelayTransport...")
         _remoteClient.client.RelayTransport = P2PRelayTransport
+
+    def script_toggleMicrophone(self, gesture):
+        if not webrtc_available:
+            return
+        
+        try:
+            if not p2p_webrtc.is_connected():
+                import ui
+                ui.message("Not connected to a P2P remote session")
+                return
+            
+            current_mute = p2p_webrtc.is_mic_muted()
+            new_mute = not current_mute
+            p2p_webrtc.set_mic_muted(new_mute)
+            
+            import winsound
+            import ui
+            if new_mute:
+                winsound.Beep(800, 100)
+                winsound.Beep(500, 150)
+                ui.message("Microphone muted")
+            else:
+                winsound.Beep(500, 100)
+                winsound.Beep(800, 150)
+                ui.message("Microphone unmuted")
+        except Exception as e:
+            log.error(f"P2P Override: Error toggling microphone: {e}")
+
+    # Set script category and gesture bindings
+    script_toggleMicrophone.category = "P2P NVDA Remote"
+    script_toggleMicrophone.__doc__ = "Toggles the microphone state for voice communication during a P2P session."
+    
+    __gestures = {
+        "kb:control+shift+m": "toggleMicrophone"
+    }

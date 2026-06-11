@@ -14,4 +14,4 @@ Thumbs.db
 
 # Packaged add-on binary
 *.nvda-addon
-
+*.pyd
