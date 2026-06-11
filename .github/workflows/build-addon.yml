@@ -32,28 +32,16 @@ jobs:
     - name: Set up Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: x86_64-pc-windows-msvc
+        targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc, aarch64-pc-windows-msvc
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust_src -> target"
 
-    - name: Build Rust WebRTC binary
+    - name: Build and Package NVDA Add-on
       run: |
-        cd rust_src
-        cargo build --release
-
-    - name: Copy release binary to addon lib folder
-      run: |
-        # Create lib folder if it doesn't exist
-        New-Item -ItemType Directory -Force -Path addon/lib
-        # Copy and rename DLL to PYD
-        Copy-Item -Force rust_src/target/release/p2p_webrtc.dll addon/lib/p2p_webrtc.pyd
-
-    - name: Package NVDA Add-on
-      run: |
-        python package_addon.py
+        python build.py --all
 
     - name: Upload Packaged Add-on Artifact
       uses: actions/upload-artifact@v4

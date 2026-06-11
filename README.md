@@ -40,25 +40,25 @@ If you wish to build the extension from source or contribute to its development,
 
 ### Prerequisites
 *   [Rust Toolchain](https://rustup.rs/) (Cargo)
-*   Python 3.13 (installed on Windows)
+*   Python 3.10+ (installed on Windows)
 
-### 1. Compile the WebRTC Rust Extension
-Navigate to the `rust_src` folder and build the release target:
-```powershell
-cargo build --manifest-path rust_src/Cargo.toml --release
-```
+### Build and Package the Add-on
+You can use the unified build automation script `build.py` at the root directory to build the WebRTC Rust extension, organize the binaries, and package the add-on:
 
-### 2. Copy the Native Binary
-Rename and copy the compiled library into the add-on's library directory:
-```powershell
-Copy-Item -Path rust_src/target/release/p2p_webrtc.dll -Destination addon/lib/p2p_webrtc.pyd -Force
-```
+1. **Build for Host Architecture only** (fast, recommended for local testing):
+   ```powershell
+   python build.py
+   ```
 
-### 3. Package the Add-on
-Run the packaging script at the root directory to generate the `.nvda-addon` file:
-```powershell
-python package_addon.py
-```
+2. **Build for all supported architectures** (x64, x86, and ARM64):
+   ```powershell
+   python build.py --all
+   ```
+
+3. **Build for a specific target**:
+   ```powershell
+   python build.py --target i686-pc-windows-msvc
+   ```
 
 ---
 

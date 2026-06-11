@@ -1,5 +1,7 @@
 import sys
 import os
+import platform
+import struct
 import threading
 import time
 import socket
@@ -7,11 +9,31 @@ import select
 import globalPluginHandler
 from logHandler import log
 
-# Inject the lib folder into sys.path to ensure we can import our native .pyd module
+def get_architecture_folder():
+    machine = platform.machine().lower()
+    is_64bit = struct.calcsize("P") == 8
+    
+    if not is_64bit:
+        # 32-bit processes (like NVDA x86 under WoW64) can only load x86 native modules
+        return "x86"
+    
+    # 64-bit processes: check for ARM64 vs standard AMD64/x86_64
+    if "arm" in machine or "aarch64" in machine:
+        return "arm64"
+    else:
+        return "x64"
+
+# Inject the architecture-specific lib folder into sys.path
 addon_root = os.path.dirname(os.path.dirname(__file__))
-lib_dir = os.path.join(addon_root, "lib")
+arch_folder = get_architecture_folder()
+lib_dir = os.path.join(addon_root, "lib", arch_folder)
 if lib_dir not in sys.path:
-    sys.path.append(lib_dir)
+    sys.path.insert(0, lib_dir)
+
+# Also fallback to root lib directory for backward compatibility
+fallback_lib_dir = os.path.join(addon_root, "lib")
+if fallback_lib_dir not in sys.path:
+    sys.path.append(fallback_lib_dir)
 
 try:
     import p2p_webrtc
