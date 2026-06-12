@@ -213,15 +213,32 @@ class FileSenderThread(threading.Thread):
             last_reported_percent = 0
 
             with open(source_path, "rb") as f:
+                chunk_count = 0
                 while self.bytes_sent < file_size and not self.cancelled:
-                    # Flow control: wait if we have sent more than 1MB ahead of the receiver's disk writes
-                    # OR if the local WebRTC send buffer is saturated (> 512KB)
-                    first_wait = True
-                    while (self.bytes_sent - self.bytes_acked > 1024 * 1024 or self.get_buffered_amount_fn() > 524288) and not self.cancelled:
-                        if first_wait:
-                            log.info(f"P2P File Transfer: Flow control wait. bytes_sent: {self.bytes_sent}, bytes_acked: {self.bytes_acked}, local_buffered: {self.get_buffered_amount_fn()}")
-                            first_wait = False
-                        time.sleep(0.01)
+                    # Flow control: check if we need to pause
+                    # 1. Window check (cheap CPU comparison)
+                    window_excess = self.bytes_sent - self.bytes_acked > 1024 * 1024
+                    
+                    # 2. Local buffer check (expensive native call, check every 16 chunks)
+                    buffer_excess = False
+                    if not window_excess and chunk_count % 16 == 0:
+                        buffer_excess = self.get_buffered_amount_fn() > 524288
+                        
+                    if window_excess or buffer_excess:
+                        first_wait = True
+                        while not self.cancelled:
+                            window_excess = self.bytes_sent - self.bytes_acked > 1024 * 1024
+                            if not window_excess:
+                                local_buf = self.get_buffered_amount_fn()
+                                if local_buf <= 524288:
+                                    break
+                            else:
+                                local_buf = "N/A (window exceeded)"
+                                
+                            if first_wait:
+                                log.info(f"P2P File Transfer: Flow control wait. bytes_sent: {self.bytes_sent}, bytes_acked: {self.bytes_acked}, local_buffered: {local_buf}")
+                                first_wait = False
+                            time.sleep(0.01)
 
                     chunk = f.read(chunk_size)
                     if not chunk:
@@ -234,7 +251,7 @@ class FileSenderThread(threading.Thread):
                     self.send_chunk_fn(compressed)
 
                     self.bytes_sent += len(chunk)
-                    log.info(f"P2P File Transfer: Sent chunk. bytes_sent: {self.bytes_sent}, bytes_acked: {self.bytes_acked}")
+                    chunk_count += 1
                     percent = int((self.bytes_sent / file_size) * 100)
                     if percent // 10 > last_reported_percent // 10:
                         last_reported_percent = percent

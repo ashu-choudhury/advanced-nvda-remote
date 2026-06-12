@@ -289,7 +289,8 @@ class P2PRelayTransport(RelayTransport):
         try:
             obj = json.loads(msg_str)
             msg_type = obj.get("type")
-            log.info(f"P2P Override: parse_file_message msg_type: {msg_type}")
+            if msg_type not in ("p2p_file_chunk", "p2p_file_ack"):
+                log.info(f"P2P Override: parse_file_message msg_type: {msg_type}")
             if msg_type == "p2p_file_start":
                 filename = obj.get("filename")
                 size = obj.get("size")
@@ -301,17 +302,14 @@ class P2PRelayTransport(RelayTransport):
                 data = obj.get("data")
                 if hasattr(self, "file_receiver") and self.file_receiver:
                     chunk_len = self.file_receiver.write_chunk(data)
-                    log.info(f"P2P Override: Received chunk of size {chunk_len}")
                     # Send ACK back to the sender
                     ack_payload = {
                         "type": "p2p_file_ack",
                         "bytes": chunk_len
                     }
                     success = p2p_webrtc.send_file_message(json.dumps(ack_payload))
-                    log.info(f"P2P Override: Sent ACK. Success: {success}")
             elif msg_type == "p2p_file_ack":
                 ack_bytes = obj.get("bytes", 0)
-                log.info(f"P2P Override: Received ACK for {ack_bytes} bytes")
                 if hasattr(self, "file_sender") and self.file_sender:
                     self.file_sender.handle_ack(ack_bytes)
             elif msg_type == "p2p_file_end":
@@ -324,6 +322,20 @@ class P2PRelayTransport(RelayTransport):
                 if hasattr(self, "file_receiver") and self.file_receiver:
                     self.file_receiver.abort()
                     self.file_receiver = None
+                if hasattr(self, "file_sender") and self.file_sender:
+                    self.file_sender.cancelled = True
+            elif msg_type == "p2p_ping":
+                timestamp = obj.get("timestamp")
+                pong_payload = {
+                    "type": "p2p_pong",
+                    "timestamp": timestamp
+                }
+                p2p_webrtc.send_file_message(json.dumps(pong_payload))
+            elif msg_type == "p2p_pong":
+                timestamp = obj.get("timestamp", 0)
+                if timestamp > 0:
+                    rtt = (time.time() - timestamp) * 1000
+                    ui.message(f"Ping: {rtt:.1f} ms")
         except Exception as e:
             log.error(f"P2P Override: Error parsing file message: {e}")
 
@@ -331,14 +343,12 @@ class P2PRelayTransport(RelayTransport):
         try:
             if hasattr(self, "file_receiver") and self.file_receiver:
                 chunk_len = self.file_receiver.write_chunk(data)
-                log.info(f"P2P Override: Received chunk of size {chunk_len}")
                 # Send ACK back to the sender
                 ack_payload = {
                     "type": "p2p_file_ack",
                     "bytes": chunk_len
                 }
                 success = p2p_webrtc.send_file_message(json.dumps(ack_payload))
-                log.info(f"P2P Override: Sent ACK. Success: {success}")
         except Exception as e:
             log.error(f"P2P Override: Error handling file chunk: {e}")
 
@@ -350,13 +360,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         log.info("P2P Override: Installing monkey-patch for _remoteClient.client.RelayTransport...")
         _remoteClient.client.RelayTransport = P2PRelayTransport
 
-        # Register script_toggleMicrophone as a local script
+        # Register local scripts
         try:
             if _remoteClient._remoteClient is not None:
                 _remoteClient._remoteClient.registerLocalScript(self.script_toggleMicrophone)
-                log.info("P2P Override: Registered script_toggleMicrophone as a local script.")
+                _remoteClient._remoteClient.registerLocalScript(self.script_cancelFileTransfer)
+                _remoteClient._remoteClient.registerLocalScript(self.script_pingPeer)
+                log.info("P2P Override: Registered local scripts.")
         except Exception as e:
-            log.error(f"P2P Override: Failed to register script_toggleMicrophone as a local script: {e}")
+            log.error(f"P2P Override: Failed to register local scripts: {e}")
 
         # Monkey-patch pushClipboard to support file transfer
         try:
@@ -391,13 +403,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             log.error(f"P2P Override: Failed to patch pushClipboard: {e}")
 
     def terminate(self):
-        # Unregister local script
+        # Unregister local scripts
         try:
             if _remoteClient._remoteClient is not None:
                 _remoteClient._remoteClient.unregisterLocalScript(self.script_toggleMicrophone)
-                log.info("P2P Override: Unregistered script_toggleMicrophone local script.")
+                _remoteClient._remoteClient.unregisterLocalScript(self.script_cancelFileTransfer)
+                _remoteClient._remoteClient.unregisterLocalScript(self.script_pingPeer)
+                log.info("P2P Override: Unregistered local scripts.")
         except Exception as e:
-            log.error(f"P2P Override: Failed to unregister script_toggleMicrophone local script: {e}")
+            log.error(f"P2P Override: Failed to unregister local scripts: {e}")
 
         # Restore original pushClipboard
         try:
@@ -433,6 +447,61 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     script_toggleMicrophone.category = "P2P NVDA Remote"
     script_toggleMicrophone.__doc__ = "Toggles the microphone state for voice communication during a P2P session."
     
+    def script_cancelFileTransfer(self, gesture):
+        client_inst = _remoteClient._remoteClient
+        if not client_inst:
+            ui.message("Not connected")
+            return
+        transport = client_inst.followerTransport or client_inst.leaderTransport
+        if not transport or not getattr(transport, "use_webrtc", False):
+            ui.message("Not connected to a P2P remote session")
+            return
+            
+        cancelled_any = False
+        if hasattr(transport, "file_sender") and transport.file_sender and transport.file_sender.is_alive():
+            transport.file_sender.cancelled = True
+            cancelled_any = True
+            
+        if hasattr(transport, "file_receiver") and transport.file_receiver:
+            transport.file_receiver.abort()
+            transport.file_receiver = None
+            p2p_webrtc.send_file_message(json.dumps({"type": "p2p_file_abort"}))
+            cancelled_any = True
+            
+        if cancelled_any:
+            ui.message("File transfer cancelled")
+        else:
+            ui.message("No active file transfer")
+
+    script_cancelFileTransfer.category = "P2P NVDA Remote"
+    script_cancelFileTransfer.__doc__ = "Cancels the active P2P file transfer."
+
+    def script_pingPeer(self, gesture):
+        client_inst = _remoteClient._remoteClient
+        if not client_inst:
+            ui.message("Not connected")
+            return
+        transport = client_inst.followerTransport or client_inst.leaderTransport
+        if not transport or not getattr(transport, "use_webrtc", False):
+            ui.message("Not connected to a P2P remote session")
+            return
+        
+        # Send ping request
+        timestamp = time.time()
+        payload = {
+            "type": "p2p_ping",
+            "timestamp": timestamp
+        }
+        if p2p_webrtc.send_file_message(json.dumps(payload)):
+            pass
+        else:
+            ui.message("Failed to send ping")
+
+    script_pingPeer.category = "P2P NVDA Remote"
+    script_pingPeer.__doc__ = "Pings the peer device to measure latency."
+    
     __gestures = {
-        "kb:control+shift+m": "toggleMicrophone"
+        "kb:control+shift+m": "toggleMicrophone",
+        "kb:control+shift+c": "cancelFileTransfer",
+        "kb:nvda+alt+p": "pingPeer"
     }
