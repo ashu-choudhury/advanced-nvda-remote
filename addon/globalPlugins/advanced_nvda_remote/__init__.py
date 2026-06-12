@@ -5,6 +5,7 @@ import struct
 import threading
 import time
 import socket
+import ssl
 import select
 import globalPluginHandler
 import json
@@ -99,10 +100,37 @@ class P2PRelayTransport(RelayTransport):
                 self.serverSock = self.createOutboundSocket(*self.address, insecure=self.insecure)
                 self.serverSock.connect(self.address)
                 self.relay_sock = self.serverSock
+            except ssl.SSLCertVerificationError:
+                fingerprint = None
+                try:
+                    fingerprint = self.getHostFingerprint()
+                except Exception:
+                    pass
+                if self.isFingerprintTrusted(fingerprint):
+                    self._trustedFingerprint = fingerprint
+                    self.insecure = True
+                    return self.run()
+                self.lastFailFingerprint = fingerprint
+                self.transportCertificateAuthenticationFailed.notify()
+                raise
             except Exception as e:
                 log.error(f"P2P Override: Failed to connect to relay server: {e}")
                 self.transportConnectionFailed.notify()
                 raise
+
+            # If connecting without certificate verification and we were given a fingerprint to trust,
+            # check that the server's certificate matches it.
+            if (
+                self.insecure
+                and self._trustedFingerprint is not None
+                and (fingerprint := self._derCert2fingerprint(self.serverSock.getpeercert(True)))
+                != self._trustedFingerprint
+            ):
+                self._disconnect()
+                self.lastFailFingerprint = fingerprint
+                self.transportCertificateAuthenticationFailed.notify()
+                self.transportConnectionFailed.notify()
+                return
 
             self.onTransportConnected()
             self.startQueueThread()
@@ -151,13 +179,19 @@ class P2PRelayTransport(RelayTransport):
                         except Exception as e:
                             log.error(f"P2P Override: Failed to start audio pipeline: {e}")
                 else:
-                    # Read from direct WebRTC Data Channel
+                    # Read from direct WebRTC Data Channel (combined control & file events)
                     try:
-                        msg = p2p_webrtc.recv_message()
-                        if msg:
-                            # Append a newline because NVDA's deserializer expects lines
-                            line = (msg + "\n").encode("utf-8")
-                            self.parse(line)
+                        event = p2p_webrtc.recv_message()
+                        if event:
+                            channel, msg = event
+                            if channel == 0:
+                                # Append a newline because NVDA's deserializer expects lines
+                                line = (msg + "\n").encode("utf-8")
+                                self.parse(line)
+                            elif channel == 1:
+                                self.parse_file_message(msg)
+                            elif channel == 2:
+                                self.handle_file_chunk(msg)
                     except Exception as e:
                         log.error(f"P2P Override: Error in WebRTC message polling: {e}")
                         break
@@ -166,14 +200,6 @@ class P2PRelayTransport(RelayTransport):
                     if not p2p_webrtc.is_connected():
                         log.warn("P2P Override: WebRTC Data Channel disconnected.")
                         break
-
-                    # Read from direct file channel
-                    try:
-                        file_msg = p2p_webrtc.recv_file_message()
-                        if file_msg:
-                            self.parse_file_message(file_msg)
-                    except Exception as e:
-                        log.error(f"P2P Override: Error in WebRTC file message polling: {e}")
 
                     # Periodically verify audio pipeline health (every 2 seconds)
                     now = time.time()
@@ -263,35 +289,58 @@ class P2PRelayTransport(RelayTransport):
         try:
             obj = json.loads(msg_str)
             msg_type = obj.get("type")
+            log.info(f"P2P Override: parse_file_message msg_type: {msg_type}")
             if msg_type == "p2p_file_start":
                 filename = obj.get("filename")
                 size = obj.get("size")
                 is_zip = obj.get("is_zip", False)
+                log.info(f"P2P Override: Starting file receive. filename: {filename}, size: {size}, is_zip: {is_zip}")
                 self.file_receiver = p2p_file_transfer.FileReceiver()
                 self.file_receiver.start(filename, size, is_zip)
             elif msg_type == "p2p_file_chunk":
                 data = obj.get("data")
                 if hasattr(self, "file_receiver") and self.file_receiver:
                     chunk_len = self.file_receiver.write_chunk(data)
+                    log.info(f"P2P Override: Received chunk of size {chunk_len}")
                     # Send ACK back to the sender
                     ack_payload = {
                         "type": "p2p_file_ack",
                         "bytes": chunk_len
                     }
-                    p2p_webrtc.send_file_message(json.dumps(ack_payload))
+                    success = p2p_webrtc.send_file_message(json.dumps(ack_payload))
+                    log.info(f"P2P Override: Sent ACK. Success: {success}")
             elif msg_type == "p2p_file_ack":
+                ack_bytes = obj.get("bytes", 0)
+                log.info(f"P2P Override: Received ACK for {ack_bytes} bytes")
                 if hasattr(self, "file_sender") and self.file_sender:
-                    self.file_sender.handle_ack(obj.get("bytes", 0))
+                    self.file_sender.handle_ack(ack_bytes)
             elif msg_type == "p2p_file_end":
+                log.info("P2P Override: Received file end message")
                 if hasattr(self, "file_receiver") and self.file_receiver:
                     self.file_receiver.finalize()
                     self.file_receiver = None
             elif msg_type == "p2p_file_abort":
+                log.info("P2P Override: Received file abort message")
                 if hasattr(self, "file_receiver") and self.file_receiver:
                     self.file_receiver.abort()
                     self.file_receiver = None
         except Exception as e:
             log.error(f"P2P Override: Error parsing file message: {e}")
+
+    def handle_file_chunk(self, data):
+        try:
+            if hasattr(self, "file_receiver") and self.file_receiver:
+                chunk_len = self.file_receiver.write_chunk(data)
+                log.info(f"P2P Override: Received chunk of size {chunk_len}")
+                # Send ACK back to the sender
+                ack_payload = {
+                    "type": "p2p_file_ack",
+                    "bytes": chunk_len
+                }
+                success = p2p_webrtc.send_file_message(json.dumps(ack_payload))
+                log.info(f"P2P Override: Sent ACK. Success: {success}")
+        except Exception as e:
+            log.error(f"P2P Override: Error handling file chunk: {e}")
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -315,13 +364,23 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             def patched_pushClipboard(client_inst):
                 files = p2p_file_transfer.get_files_from_clipboard()
+                log.info(f"P2P Override: patched_pushClipboard called. files: {files}")
                 if files:
                     transport = client_inst.followerTransport or client_inst.leaderTransport
-                    if transport and getattr(transport, "use_webrtc", False) and p2p_webrtc.has_file_channel():
-                        sender = p2p_file_transfer.FileSenderThread(files, p2p_webrtc.send_file_message)
+                    use_webrtc = getattr(transport, "use_webrtc", False) if transport else False
+                    has_file_channel = p2p_webrtc.has_file_channel() if webrtc_available else False
+                    log.info(f"P2P Override: transport: {transport}, use_webrtc: {use_webrtc}, has_file_channel: {has_file_channel}")
+                    if transport and use_webrtc and has_file_channel:
+                        sender = p2p_file_transfer.FileSenderThread(
+                            files,
+                            p2p_webrtc.send_file_message,
+                            p2p_webrtc.send_file_chunk,
+                            p2p_webrtc.get_file_buffered_amount
+                        )
                         transport.file_sender = sender
                         sender.start()
                     else:
+                        log.info("P2P Override: Condition not met. Falling back to original pushClipboard.")
                         self.original_pushClipboard(client_inst)
                 else:
                     self.original_pushClipboard(client_inst)

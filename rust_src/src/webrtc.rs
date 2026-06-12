@@ -6,6 +6,7 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::data_channel::RTCDataChannel;
@@ -24,8 +25,7 @@ struct PeerState {
     audio_channel: Option<Arc<RTCDataChannel>>,
     file_channel: Option<Arc<RTCDataChannel>>,
     local_candidates: Arc<Mutex<Vec<String>>>,
-    received_messages: Arc<Mutex<VecDeque<String>>>,
-    received_file_messages: Arc<Mutex<VecDeque<String>>>,
+    received_messages: Arc<Mutex<VecDeque<(u8, Vec<u8>)>>>,
     is_connected: Arc<Mutex<bool>>,
     received_condvar: Arc<Condvar>,
 }
@@ -51,13 +51,11 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
 
     let local_candidates = Arc::new(Mutex::new(Vec::new()));
     let received_messages = Arc::new(Mutex::new(VecDeque::new()));
-    let received_file_messages = Arc::new(Mutex::new(VecDeque::new()));
     let is_connected = Arc::new(Mutex::new(false));
     let received_condvar = Arc::new(Condvar::new());
  
     let local_candidates_clone = Arc::clone(&local_candidates);
     let received_messages_clone = Arc::clone(&received_messages);
-    let received_file_messages_clone = Arc::clone(&received_file_messages);
     let is_connected_clone = Arc::clone(&is_connected);
     let received_condvar_clone = Arc::clone(&received_condvar);
  
@@ -97,6 +95,20 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             }
             Box::pin(async {})
         }));
+
+        let ic_clone_state = Arc::clone(&is_connected_clone);
+        let cv_clone_state = Arc::clone(&received_condvar_clone);
+        pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+            if state == RTCPeerConnectionState::Disconnected 
+                || state == RTCPeerConnectionState::Failed 
+                || state == RTCPeerConnectionState::Closed 
+            {
+                let mut ic = ic_clone_state.lock().unwrap();
+                *ic = false;
+                cv_clone_state.notify_all();
+            }
+            Box::pin(async {})
+        }));
  
         let dc = pc
             .create_data_channel("nvda-remote", None)
@@ -125,11 +137,9 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
         let rm_clone = Arc::clone(&received_messages_clone);
         let cv_clone3 = Arc::clone(&received_condvar_clone);
         dc.on_message(Box::new(move |msg| {
-            if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
-                let mut rm = rm_clone.lock().unwrap();
-                rm.push_back(msg_str);
-                cv_clone3.notify_one();
-            }
+            let mut rm = rm_clone.lock().unwrap();
+            rm.push_back((0, msg.data.to_vec()));
+            cv_clone3.notify_one();
             Box::pin(async {})
         }));
  
@@ -171,12 +181,13 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             .map_err(|e| format!("Failed to create File Data Channel: {:?}", e))?;
         let file_dc_shared = Arc::clone(&file_dc);
  
-        let rfm_clone = Arc::clone(&received_file_messages_clone);
+        let rfm_clone = Arc::clone(&received_messages_clone);
+        let cv_clone4 = Arc::clone(&received_condvar_clone);
         file_dc.on_message(Box::new(move |msg| {
-            if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
-                let mut rfm = rfm_clone.lock().unwrap();
-                rfm.push_back(msg_str);
-            }
+            let mut rm = rfm_clone.lock().unwrap();
+            let channel = if msg.is_string { 1 } else { 2 };
+            rm.push_back((channel, msg.data.to_vec()));
+            cv_clone4.notify_one();
             Box::pin(async {})
         }));
  
@@ -195,7 +206,6 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
         file_channel,
         local_candidates,
         received_messages,
-        received_file_messages,
         is_connected,
         received_condvar,
     });
@@ -211,13 +221,11 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
 
     let local_candidates = Arc::new(Mutex::new(Vec::new()));
     let received_messages = Arc::new(Mutex::new(VecDeque::new()));
-    let received_file_messages = Arc::new(Mutex::new(VecDeque::new()));
     let is_connected = Arc::new(Mutex::new(false));
     let received_condvar = Arc::new(Condvar::new());
 
     let local_candidates_clone = Arc::clone(&local_candidates);
     let received_messages_clone = Arc::clone(&received_messages);
-    let received_file_messages_clone = Arc::clone(&received_file_messages);
     let is_connected_clone = Arc::clone(&is_connected);
     let received_condvar_clone = Arc::clone(&received_condvar);
 
@@ -254,6 +262,20 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                         lc.push(candidate_json);
                     }
                 }
+            }
+            Box::pin(async {})
+        }));
+
+        let ic_clone_state = Arc::clone(&is_connected_clone);
+        let cv_clone_state = Arc::clone(&received_condvar_clone);
+        pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+            if state == RTCPeerConnectionState::Disconnected 
+                || state == RTCPeerConnectionState::Failed 
+                || state == RTCPeerConnectionState::Closed 
+            {
+                let mut ic = ic_clone_state.lock().unwrap();
+                *ic = false;
+                cv_clone_state.notify_all();
             }
             Box::pin(async {})
         }));
@@ -302,12 +324,13 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                 }
             } else if label == "nvda-remote-file" {
                 let file_dc = Arc::clone(&dc);
-                let rfm_clone = Arc::clone(&received_file_messages_clone);
+                let rfm_clone = Arc::clone(&received_messages_clone);
+                let cv_clone_file = Arc::clone(&received_condvar_clone);
                 file_dc.on_message(Box::new(move |msg| {
-                    if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
-                        let mut rfm = rfm_clone.lock().unwrap();
-                        rfm.push_back(msg_str);
-                    }
+                    let mut rm = rfm_clone.lock().unwrap();
+                    let channel = if msg.is_string { 1 } else { 2 };
+                    rm.push_back((channel, msg.data.to_vec()));
+                    cv_clone_file.notify_one();
                     Box::pin(async {})
                 }));
 
@@ -331,11 +354,9 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                 }));
 
                 dc.on_message(Box::new(move |msg| {
-                    if let Ok(msg_str) = String::from_utf8(msg.data.to_vec()) {
-                        let mut rm = rm_msg.lock().unwrap();
-                        rm.push_back(msg_str);
-                        cv_msg.notify_one();
-                    }
+                    let mut rm = rm_msg.lock().unwrap();
+                    rm.push_back((0, msg.data.to_vec()));
+                    cv_msg.notify_one();
                     Box::pin(async {})
                 }));
 
@@ -359,7 +380,6 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
         file_channel: None,
         local_candidates,
         received_messages,
-        received_file_messages,
         is_connected,
         received_condvar,
     });
@@ -482,7 +502,7 @@ pub fn send_message(msg: String) -> Result<bool, String> {
     }
 }
 
-pub fn recv_message() -> Result<Option<String>, String> {
+pub fn recv_message() -> Result<Option<(u8, Vec<u8>)>, String> {
     let (received_messages, is_connected, received_condvar) = {
         let state_guard = STATE.lock().unwrap();
         if let Some(ref state) = *state_guard {
@@ -636,13 +656,41 @@ pub fn send_file_message(msg: String) -> Result<bool, String> {
     }
 }
 
-pub fn recv_file_message() -> Result<Option<String>, String> {
+
+
+pub fn send_file_chunk(data: Vec<u8>) -> Result<bool, String> {
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
-        let mut rfm = state.received_file_messages.lock().unwrap();
-        Ok(rfm.pop_front())
+        if let Some(ref dc) = state.file_channel {
+            let dc_clone = Arc::clone(dc);
+            RUNTIME.spawn(async move {
+                if let Err(e) = dc_clone.send(&Bytes::from(data)).await {
+                    eprintln!("WebRTC File Send Error: {:?}", e);
+                }
+            });
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     } else {
-        Ok(None)
+        Ok(false)
+    }
+}
+
+pub fn get_file_buffered_amount() -> Result<usize, String> {
+    let state_guard = STATE.lock().unwrap();
+    if let Some(ref state) = *state_guard {
+        if let Some(ref dc) = state.file_channel {
+            let dc_clone = Arc::clone(dc);
+            let amount = RUNTIME.block_on(async move {
+                dc_clone.buffered_amount().await
+            });
+            Ok(amount)
+        } else {
+            Ok(0)
+        }
+    } else {
+        Ok(0)
     }
 }
 
@@ -753,10 +801,6 @@ mod tests {
         let recv = recv_message();
         assert!(recv.is_ok());
         assert_eq!(recv.unwrap(), None);
-
-        let recv_file = recv_file_message();
-        assert!(recv_file.is_ok());
-        assert_eq!(recv_file.unwrap(), None);
     }
 
     #[test]

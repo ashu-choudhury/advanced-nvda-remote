@@ -25,6 +25,37 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 shell32 = ctypes.windll.shell32
 
+# Configure ctypes signatures for 64-bit/32-bit Windows compatibility
+user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+user32.OpenClipboard.restype = ctypes.c_int
+
+user32.GetClipboardData.argtypes = [ctypes.c_uint]
+user32.GetClipboardData.restype = ctypes.c_void_p
+
+user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+user32.SetClipboardData.restype = ctypes.c_void_p
+
+user32.CloseClipboard.argtypes = []
+user32.CloseClipboard.restype = ctypes.c_int
+
+user32.EmptyClipboard.argtypes = []
+user32.EmptyClipboard.restype = ctypes.c_int
+
+user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+
+kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = ctypes.c_void_p
+
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalUnlock.restype = ctypes.c_int
+
+shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+shell32.DragQueryFileW.restype = ctypes.c_uint
+
 class DROPFILES(ctypes.Structure):
     _fields_ = (
         ('pFiles', wintypes.DWORD),  # Offset to the start of the file list
@@ -93,10 +124,12 @@ def set_clipboard_hdrop_and_move(file_paths):
     return success
 
 class FileSenderThread(threading.Thread):
-    def __init__(self, paths, send_fn):
+    def __init__(self, paths, send_fn, send_chunk_fn, get_buffered_amount_fn):
         super().__init__()
         self.paths = paths
         self.send_fn = send_fn
+        self.send_chunk_fn = send_chunk_fn
+        self.get_buffered_amount_fn = get_buffered_amount_fn
         self.daemon = True
         self.cancelled = False
         self.bytes_sent = 0
@@ -174,7 +207,7 @@ class FileSenderThread(threading.Thread):
             self.send_fn(json.dumps(start_payload))
 
             # Send chunks with stream compression
-            chunk_size = 262144 # 256KB
+            chunk_size = 32768 # 32KB (safe limit for WebRTC data channels to account for zlib overhead)
             self.bytes_sent = 0
             self.bytes_acked = 0
             last_reported_percent = 0
@@ -182,7 +215,12 @@ class FileSenderThread(threading.Thread):
             with open(source_path, "rb") as f:
                 while self.bytes_sent < file_size and not self.cancelled:
                     # Flow control: wait if we have sent more than 1MB ahead of the receiver's disk writes
-                    while self.bytes_sent - self.bytes_acked > 1024 * 1024 and not self.cancelled:
+                    # OR if the local WebRTC send buffer is saturated (> 512KB)
+                    first_wait = True
+                    while (self.bytes_sent - self.bytes_acked > 1024 * 1024 or self.get_buffered_amount_fn() > 524288) and not self.cancelled:
+                        if first_wait:
+                            log.info(f"P2P File Transfer: Flow control wait. bytes_sent: {self.bytes_sent}, bytes_acked: {self.bytes_acked}, local_buffered: {self.get_buffered_amount_fn()}")
+                            first_wait = False
                         time.sleep(0.01)
 
                     chunk = f.read(chunk_size)
@@ -191,21 +229,18 @@ class FileSenderThread(threading.Thread):
                     
                     # Compress chunk using zlib (level 1 = fastest)
                     compressed = zlib.compress(chunk, 1)
-                    encoded = base64.b64encode(compressed).decode('utf-8')
 
-                    chunk_payload = {
-                        "type": "p2p_file_chunk",
-                        "data": encoded
-                    }
-                    self.send_fn(json.dumps(chunk_payload))
+                    # Send raw compressed binary chunk on Channel 2
+                    self.send_chunk_fn(compressed)
 
                     self.bytes_sent += len(chunk)
+                    log.info(f"P2P File Transfer: Sent chunk. bytes_sent: {self.bytes_sent}, bytes_acked: {self.bytes_acked}")
                     percent = int((self.bytes_sent / file_size) * 100)
                     if percent // 10 > last_reported_percent // 10:
                         last_reported_percent = percent
                         wx.CallAfter(ui.message, f"Uploading: {percent}%")
                         # Play a short tick sound
-                        wx.CallAfter(tones.playTone, 440, 30)
+                        wx.CallAfter(tones.beep, 440, 30)
 
             # Cleanup temp zip if we created one
             if is_zip and os.path.exists(source_path):
@@ -220,9 +255,9 @@ class FileSenderThread(threading.Thread):
             self.send_fn(json.dumps({"type": "p2p_file_end"}))
             wx.CallAfter(ui.message, "File transfer complete.")
             # Play success chime
-            wx.CallAfter(tones.playTone, 523, 100)
+            wx.CallAfter(tones.beep, 523, 100)
             time.sleep(0.1)
-            wx.CallAfter(tones.playTone, 659, 150)
+            wx.CallAfter(tones.beep, 659, 150)
 
         except Exception as e:
             log.error(f"P2P File Transfer: Error in sender thread: {e}")
@@ -253,12 +288,16 @@ class FileReceiver:
         
         wx.CallAfter(ui.message, f"Receiving file: {filename} ({size / (1024*1024):.1f} MB)...")
 
-    def write_chunk(self, encoded_data):
+    def write_chunk(self, data):
         if not self.file_handle:
             return
         
-        # Base64 decode and zlib decompress
-        compressed = base64.b64decode(encoded_data)
+        # Support base64 strings from older senders for backward compatibility
+        if isinstance(data, str):
+            compressed = base64.b64decode(data.encode('utf-8') if hasattr(data, 'encode') else data)
+        else:
+            compressed = data
+            
         chunk = zlib.decompress(compressed)
         
         self.file_handle.write(chunk)
@@ -270,7 +309,7 @@ class FileReceiver:
             if percent // 10 > self.last_reported_percent // 10:
                 self.last_reported_percent = percent
                 wx.CallAfter(ui.message, f"Downloading: {percent}%")
-                wx.CallAfter(tones.playTone, 550, 30)
+                wx.CallAfter(tones.beep, 550, 30)
 
         return len(chunk)
 
@@ -310,9 +349,9 @@ class FileReceiver:
             if set_clipboard_hdrop_and_move(final_paths):
                 wx.CallAfter(ui.message, "File ready. Press Control V to paste.")
                 # Play success chime
-                wx.CallAfter(tones.playTone, 659, 100)
+                wx.CallAfter(tones.beep, 659, 100)
                 time.sleep(0.1)
-                wx.CallAfter(tones.playTone, 523, 150)
+                wx.CallAfter(tones.beep, 523, 150)
             else:
                 wx.CallAfter(ui.message, "Failed to write files to clipboard.")
         except Exception as e:

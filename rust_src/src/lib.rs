@@ -4,38 +4,52 @@ pub mod webrtc;
 use pyo3::prelude::*;
 
 #[pyfunction]
-fn init_leader(stun_servers: Vec<String>) -> PyResult<()> {
-    webrtc::init_leader(stun_servers).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn init_leader(py: Python<'_>, stun_servers: Vec<String>) -> PyResult<()> {
+    py.allow_threads(|| {
+        webrtc::init_leader(stun_servers).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
-fn init_follower(stun_servers: Vec<String>) -> PyResult<()> {
-    webrtc::init_follower(stun_servers).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn init_follower(py: Python<'_>, stun_servers: Vec<String>) -> PyResult<()> {
+    py.allow_threads(|| {
+        webrtc::init_follower(stun_servers).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
-fn create_offer() -> PyResult<String> {
-    webrtc::create_offer().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn create_offer(py: Python<'_>) -> PyResult<String> {
+    py.allow_threads(|| {
+        webrtc::create_offer().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
-fn set_offer(offer_json: String) -> PyResult<()> {
-    webrtc::set_offer(offer_json).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn set_offer(py: Python<'_>, offer_json: String) -> PyResult<()> {
+    py.allow_threads(|| {
+        webrtc::set_offer(offer_json).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
-fn create_answer() -> PyResult<String> {
-    webrtc::create_answer().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn create_answer(py: Python<'_>) -> PyResult<String> {
+    py.allow_threads(|| {
+        webrtc::create_answer().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
-fn set_answer(answer_json: String) -> PyResult<()> {
-    webrtc::set_answer(answer_json).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn set_answer(py: Python<'_>, answer_json: String) -> PyResult<()> {
+    py.allow_threads(|| {
+        webrtc::set_answer(answer_json).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
-fn add_ice_candidate(candidate_json: String) -> PyResult<()> {
-    webrtc::add_ice_candidate(candidate_json).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn add_ice_candidate(py: Python<'_>, candidate_json: String) -> PyResult<()> {
+    py.allow_threads(|| {
+        webrtc::add_ice_candidate(candidate_json).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pyfunction]
@@ -49,8 +63,21 @@ fn send_message(msg: String) -> PyResult<bool> {
 }
 
 #[pyfunction]
-fn recv_message() -> PyResult<Option<String>> {
-    webrtc::recv_message().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn recv_message(py: Python<'_>) -> PyResult<Option<(u8, PyObject)>> {
+    let opt = py.allow_threads(|| {
+        webrtc::recv_message().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })?;
+    
+    Ok(opt.map(|(channel, data)| {
+        if channel == 2 {
+            let py_bytes = pyo3::types::PyBytes::new_bound(py, &data);
+            (channel, py_bytes.into())
+        } else {
+            let s = String::from_utf8_lossy(&data).to_string();
+            let py_str = pyo3::types::PyString::new_bound(py, &s);
+            (channel, py_str.into())
+        }
+    }))
 }
 
 #[pyfunction]
@@ -94,8 +121,8 @@ fn send_file_message(msg: String) -> PyResult<bool> {
 }
 
 #[pyfunction]
-fn recv_file_message() -> PyResult<Option<String>> {
-    webrtc::recv_file_message().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn send_file_chunk(data: Vec<u8>) -> PyResult<bool> {
+    webrtc::send_file_chunk(data).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
 #[pyfunction]
@@ -104,8 +131,15 @@ fn has_file_channel() -> PyResult<bool> {
 }
 
 #[pyfunction]
-fn close() -> PyResult<()> {
-    webrtc::close().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+fn get_file_buffered_amount() -> PyResult<usize> {
+    webrtc::get_file_buffered_amount().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+}
+
+#[pyfunction]
+fn close(py: Python<'_>) -> PyResult<()> {
+    py.allow_threads(|| {
+        webrtc::close().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
 }
 
 #[pymodule]
@@ -128,8 +162,9 @@ fn p2p_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_audio_active, m)?)?;
     m.add_function(wrap_pyfunction!(check_default_devices_changed, m)?)?;
     m.add_function(wrap_pyfunction!(send_file_message, m)?)?;
-    m.add_function(wrap_pyfunction!(recv_file_message, m)?)?;
+    m.add_function(wrap_pyfunction!(send_file_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(has_file_channel, m)?)?;
+    m.add_function(wrap_pyfunction!(get_file_buffered_amount, m)?)?;
     m.add_function(wrap_pyfunction!(close, m)?)?;
     Ok(())
 }
