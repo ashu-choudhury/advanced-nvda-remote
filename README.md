@@ -17,9 +17,6 @@
 * **Direct Peer-to-Peer Remote Control:** Offers near-instant keypress responses and smooth screen reader navigation.
 * **Built-in Voice Chat:** Speak with the remote user directly within the session.
 * **Fast File Transfer:** Easily copy and paste files of any size directly through the clipboard.
-* **Cancel File Transfers:** Abort an active file transfer at any time.
-* **Smart Audio Device Handling:** Automatically adjusts and keeps audio working if headphones, speakers, or microphones are plugged in or changed.
-
 ---
 
 ## Keyboard Shortcuts
@@ -58,6 +55,6 @@ Run the build script from the root directory:
 
 ## License
 
-This project is licensed under the GNU General Public License (GPL) version 2, matching the license of NVDA. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License (GPL) version 2, See the [LICENSE](LICENSE) file for details.
 
 
