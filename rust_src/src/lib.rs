@@ -53,6 +53,11 @@ fn add_ice_candidate(py: Python<'_>, candidate_json: String) -> PyResult<()> {
 }
 
 #[pyfunction]
+fn get_rust_logs() -> PyResult<Vec<String>> {
+    Ok(webrtc::get_rust_logs())
+}
+
+#[pyfunction]
 fn get_local_candidates() -> PyResult<Vec<String>> {
     webrtc::get_local_candidates().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
@@ -151,6 +156,7 @@ fn p2p_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_answer, m)?)?;
     m.add_function(wrap_pyfunction!(set_answer, m)?)?;
     m.add_function(wrap_pyfunction!(add_ice_candidate, m)?)?;
+    m.add_function(wrap_pyfunction!(get_rust_logs, m)?)?;
     m.add_function(wrap_pyfunction!(get_local_candidates, m)?)?;
     m.add_function(wrap_pyfunction!(send_message, m)?)?;
     m.add_function(wrap_pyfunction!(recv_message, m)?)?;

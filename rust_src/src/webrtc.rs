@@ -18,6 +18,22 @@ pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
 });
 
+static RUST_LOGS: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+pub fn log_to_python(msg: &str) {
+    if let Ok(mut logs) = RUST_LOGS.lock() {
+        logs.push_back(msg.to_string());
+    }
+}
+
+pub fn get_rust_logs() -> Vec<String> {
+    if let Ok(mut logs) = RUST_LOGS.lock() {
+        logs.drain(..).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 #[allow(dead_code)]
 struct PeerState {
     peer_connection: Arc<RTCPeerConnection>,
@@ -44,6 +60,7 @@ static AUDIO_STATE: Lazy<Mutex<Option<AudioState>>> = Lazy::new(|| Mutex::new(No
 static STATE: Lazy<Mutex<Option<PeerState>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
+    log_to_python("Leader: init_leader called");
     let mut state_guard = STATE.lock().unwrap();
     if state_guard.is_some() {
         return Ok(());
@@ -88,6 +105,7 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             if let Some(candidate) = c {
                 if let Ok(json_val) = candidate.to_json() {
                     if let Ok(candidate_json) = serde_json::to_string(&json_val) {
+                        log_to_python(&format!("Leader gathered ICE candidate: {}", candidate_json));
                         let mut lc = lc_clone.lock().unwrap();
                         lc.push(candidate_json);
                     }
@@ -96,19 +114,12 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
-        let ic_clone_state = Arc::clone(&is_connected_clone);
-        let cv_clone_state = Arc::clone(&received_condvar_clone);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-            if state == RTCPeerConnectionState::Disconnected 
-                || state == RTCPeerConnectionState::Failed 
-                || state == RTCPeerConnectionState::Closed 
-            {
-                let mut ic = ic_clone_state.lock().unwrap();
-                *ic = false;
-                cv_clone_state.notify_all();
-            }
+            log_to_python(&format!("Leader PeerConnection State Changed: {:?}", state));
             Box::pin(async {})
         }));
+
+
  
         let dc = pc
             .create_data_channel("nvda-remote", None)
@@ -119,6 +130,7 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
         let ic_clone = Arc::clone(&is_connected_clone);
         let cv_clone1 = Arc::clone(&received_condvar_clone);
         dc.on_open(Box::new(move || {
+            log_to_python("Leader DataChannel nvda-remote on_open");
             let mut ic = ic_clone.lock().unwrap();
             *ic = true;
             cv_clone1.notify_all();
@@ -128,6 +140,7 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
         let ic_clone2 = Arc::clone(&is_connected_clone);
         let cv_clone2 = Arc::clone(&received_condvar_clone);
         dc.on_close(Box::new(move || {
+            log_to_python("Leader DataChannel nvda-remote on_close");
             let mut ic = ic_clone2.lock().unwrap();
             *ic = false;
             cv_clone2.notify_all();
@@ -214,6 +227,7 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
 }
 
 pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
+    log_to_python("Follower: init_follower called");
     let mut state_guard = STATE.lock().unwrap();
     if state_guard.is_some() {
         return Ok(());
@@ -258,6 +272,7 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
             if let Some(candidate) = c {
                 if let Ok(json_val) = candidate.to_json() {
                     if let Ok(candidate_json) = serde_json::to_string(&json_val) {
+                        log_to_python(&format!("Follower gathered ICE candidate: {}", candidate_json));
                         let mut lc = lc_clone.lock().unwrap();
                         lc.push(candidate_json);
                     }
@@ -266,25 +281,19 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
-        let ic_clone_state = Arc::clone(&is_connected_clone);
-        let cv_clone_state = Arc::clone(&received_condvar_clone);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-            if state == RTCPeerConnectionState::Disconnected 
-                || state == RTCPeerConnectionState::Failed 
-                || state == RTCPeerConnectionState::Closed 
-            {
-                let mut ic = ic_clone_state.lock().unwrap();
-                *ic = false;
-                cv_clone_state.notify_all();
-            }
+            log_to_python(&format!("Follower PeerConnection State Changed: {:?}", state));
             Box::pin(async {})
         }));
+
+
 
         let ic_clone = Arc::clone(&is_connected_clone);
         let rm_clone = Arc::clone(&received_messages_clone);
         let cv_clone = Arc::clone(&received_condvar_clone);
         pc.on_data_channel(Box::new(move |dc| {
             let label = dc.label().to_string();
+            log_to_python(&format!("Follower on_data_channel label: {}", label));
             let ic_open = Arc::clone(&ic_clone);
             let ic_close = Arc::clone(&ic_clone);
             let rm_msg = Arc::clone(&rm_clone);
@@ -340,6 +349,7 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                 }
             } else {
                 dc.on_open(Box::new(move || {
+                    log_to_python("Follower DataChannel nvda-remote on_open");
                     let mut ic = ic_open.lock().unwrap();
                     *ic = true;
                     cv_open.notify_all();
@@ -347,6 +357,7 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                 }));
 
                 dc.on_close(Box::new(move || {
+                    log_to_python("Follower DataChannel nvda-remote on_close");
                     let mut ic = ic_close.lock().unwrap();
                     *ic = false;
                     cv_close.notify_all();
@@ -407,6 +418,7 @@ pub fn create_offer() -> Result<String, String> {
 }
 
 pub fn set_offer(offer_json: String) -> Result<(), String> {
+    log_to_python("set_offer called");
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
@@ -423,6 +435,7 @@ pub fn set_offer(offer_json: String) -> Result<(), String> {
 }
 
 pub fn create_answer() -> Result<String, String> {
+    log_to_python("create_answer called");
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
@@ -442,6 +455,7 @@ pub fn create_answer() -> Result<String, String> {
 }
 
 pub fn set_answer(answer_json: String) -> Result<(), String> {
+    log_to_python("set_answer called");
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);
@@ -458,6 +472,7 @@ pub fn set_answer(answer_json: String) -> Result<(), String> {
 }
 
 pub fn add_ice_candidate(candidate_json: String) -> Result<(), String> {
+    log_to_python(&format!("add_ice_candidate: {}", candidate_json));
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
         let pc = Arc::clone(&state.peer_connection);

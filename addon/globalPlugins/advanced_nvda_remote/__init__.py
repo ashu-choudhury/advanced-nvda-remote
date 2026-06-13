@@ -137,6 +137,13 @@ class P2PRelayTransport(RelayTransport):
 
             # Main read loop: select on relay socket first, then poll WebRTC once connected
             while not self.closed:
+                # Poll for any Rust logs
+                try:
+                    for r_log in p2p_webrtc.get_rust_logs():
+                        log.info(f"P2P Override [Rust]: {r_log}")
+                except Exception as e:
+                    log.error(f"P2P Override: Error getting Rust logs: {e}")
+
                 if not self.use_webrtc:
                     # Read from relay socket
                     try:
@@ -258,12 +265,42 @@ class P2PRelayTransport(RelayTransport):
                 peer_role = "slave" if self.connectionType in ("leader", "master") else "master"
                 has_peer = any(c.get("connection_type") == peer_role for c in clients)
                 if has_peer:
+                    if self.webrtc_started:
+                        log.info("P2P Override: Peer present in channel but WebRTC is already started. Cleaning up stale session first...")
+                        self.use_webrtc = False
+                        self.webrtc_started = False
+                        self.sig_candidates_sent.clear()
+                        try:
+                            p2p_webrtc.close()
+                        except Exception as e:
+                            log.error(f"P2P Override: Error closing stale WebRTC: {e}")
                     self.initiate_webrtc()
             elif msg_type == "client_joined":
                 client = obj.get("client", {})
                 peer_role = "slave" if self.connectionType in ("leader", "master") else "master"
                 if client.get("connection_type") == peer_role:
+                    if self.webrtc_started:
+                        log.info("P2P Override: New peer joined but WebRTC is already started. Cleaning up stale session first...")
+                        self.use_webrtc = False
+                        self.webrtc_started = False
+                        self.sig_candidates_sent.clear()
+                        try:
+                            p2p_webrtc.close()
+                        except Exception as e:
+                            log.error(f"P2P Override: Error closing stale WebRTC: {e}")
                     self.initiate_webrtc()
+            elif msg_type == "client_left":
+                client = obj.get("client", {})
+                peer_role = "slave" if self.connectionType in ("leader", "master") else "master"
+                if client.get("connection_type") == peer_role:
+                    log.info("P2P Override: Peer disconnected. Resetting WebRTC status.")
+                    self.use_webrtc = False
+                    self.webrtc_started = False
+                    self.sig_candidates_sent.clear()
+                    try:
+                        p2p_webrtc.close()
+                    except Exception as e:
+                        log.error(f"P2P Override: Error closing WebRTC: {e}")
             elif msg_type == "p2p_sdp":
                 sdp = obj.get("sdp")
                 self.initiate_webrtc()
@@ -279,7 +316,12 @@ class P2PRelayTransport(RelayTransport):
                 return
             elif msg_type == "p2p_ice":
                 cand = obj.get("candidate")
-                p2p_webrtc.add_ice_candidate(cand)
+                log.info(f"P2P Override: Received remote ICE candidate: {cand}")
+                try:
+                    p2p_webrtc.add_ice_candidate(cand)
+                    log.info("P2P Override: Successfully added remote ICE candidate.")
+                except Exception as e:
+                    log.error(f"P2P Override: Failed to add remote ICE candidate: {e}")
                 return
         except Exception as e:
             log.error(f"P2P Override: Error handling signaling packet: {e}")

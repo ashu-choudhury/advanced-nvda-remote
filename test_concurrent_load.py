@@ -56,7 +56,7 @@ def run_leader():
 
     # Wait for connection
     connected = False
-    for _ in range(50):
+    for _ in range(250):
         for cand in p2p_webrtc.get_local_candidates():
             print(f"CANDIDATE:{cand}", flush=True)
         if p2p_webrtc.is_connected():
@@ -186,7 +186,7 @@ def run_follower():
 
     # Wait for connection
     connected = False
-    for _ in range(50):
+    for _ in range(250):
         for cand in p2p_webrtc.get_local_candidates():
             print(f"CANDIDATE:{cand}", flush=True)
         if p2p_webrtc.is_connected():
@@ -274,6 +274,9 @@ def run_follower():
 
 def run_coordinator():
     print("[Coordinator] Starting 100MB concurrent load test...", flush=True)
+    force_internet = "--force-internet" in sys.argv
+    if force_internet:
+        print("[Coordinator] Force Internet mode: ONLY exchanging STUN (srflx) and TURN (relay) candidates.", flush=True)
     leader_cmd = [sys.executable, __file__, "--leader"]
     follower_cmd = [sys.executable, __file__, "--follower"]
 
@@ -287,30 +290,37 @@ def run_coordinator():
         nonlocal offer
         for line in leader.stdout:
             line = line.strip()
-            # print(f"L-> {line}", flush=True) # Silenced verbose output to keep logs clean
+            print(f"[Leader] {line}", flush=True)
             if line.startswith("OFFER:"):
                 offer = line
                 follower.stdin.write(offer + "\n")
                 follower.stdin.flush()
             elif line.startswith("CANDIDATE:"):
-                follower.stdin.write(line + "\n")
-                follower.stdin.flush()
-            elif "Connected!" in line or "Completed" in line or "Starting" in line or "Transferring" in line:
-                print(f"[Coordinator] Leader: {line}", flush=True)
+                if force_internet:
+                    if "typ srflx" in line or "typ relay" in line:
+                        follower.stdin.write(line + "\n")
+                        follower.stdin.flush()
+                else:
+                    follower.stdin.write(line + "\n")
+                    follower.stdin.flush()
 
     def route_follower():
         nonlocal answer
         for line in follower.stdout:
             line = line.strip()
+            print(f"[Follower] {line}", flush=True)
             if line.startswith("ANSWER:"):
                 answer = line
                 leader.stdin.write(answer + "\n")
                 leader.stdin.flush()
             elif line.startswith("CANDIDATE:"):
-                leader.stdin.write(line + "\n")
-                leader.stdin.flush()
-            elif "Connected!" in line or "Completed" in line or "Starting" in line or "LOAD_TEST_" in line or "Total control" in line or "Audio pipeline active" in line:
-                print(f"[Coordinator] Follower: {line}", flush=True)
+                if force_internet:
+                    if "typ srflx" in line or "typ relay" in line:
+                        leader.stdin.write(line + "\n")
+                        leader.stdin.flush()
+                else:
+                    leader.stdin.write(line + "\n")
+                    leader.stdin.flush()
 
     lt = threading.Thread(target=route_leader, daemon=True)
     ft = threading.Thread(target=route_follower, daemon=True)
@@ -344,10 +354,9 @@ def run_coordinator():
     print("[Coordinator] Load test finished.", flush=True)
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--leader":
-            run_leader()
-        elif sys.argv[1] == "--follower":
-            run_follower()
+    if "--leader" in sys.argv:
+        run_leader()
+    elif "--follower" in sys.argv:
+        run_follower()
     else:
         run_coordinator()
