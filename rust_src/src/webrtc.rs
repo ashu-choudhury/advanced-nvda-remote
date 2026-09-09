@@ -114,8 +114,21 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
+        let ic_state = Arc::clone(&is_connected_clone);
+        let cv_state = Arc::clone(&received_condvar_clone);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             log_to_python(&format!("Leader PeerConnection State Changed: {:?}", state));
+            if matches!(
+                state,
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+            ) {
+                {
+                    let mut ic = ic_state.lock().unwrap();
+                    *ic = false;
+                }
+                cv_state.notify_all();
+                log_to_python("Leader: terminal PeerConnection state is marking the peer disconnected");
+            }
             Box::pin(async {})
         }));
 
@@ -281,8 +294,21 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
+        let ic_state = Arc::clone(&is_connected_clone);
+        let cv_state = Arc::clone(&received_condvar_clone);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             log_to_python(&format!("Follower PeerConnection State Changed: {:?}", state));
+            if matches!(
+                state,
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+            ) {
+                {
+                    let mut ic = ic_state.lock().unwrap();
+                    *ic = false;
+                }
+                cv_state.notify_all();
+                log_to_python("Follower: terminal PeerConnection state is marking the peer disconnected");
+            }
             Box::pin(async {})
         }));
 
@@ -533,7 +559,12 @@ pub fn recv_message() -> Result<Option<(u8, Vec<u8>)>, String> {
 
     let mut rm = received_messages.lock().unwrap();
     while rm.is_empty() && *is_connected.lock().unwrap() {
-        rm = received_condvar.wait(rm).unwrap();
+        // Recheck connection state periodically in case a disconnect
+        // notification arrives between the predicate check and the wait.
+        let (guard, _) = received_condvar
+            .wait_timeout(rm, std::time::Duration::from_millis(500))
+            .unwrap();
+        rm = guard;
     }
     Ok(rm.pop_front())
 }
