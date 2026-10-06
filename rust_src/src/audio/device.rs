@@ -12,7 +12,7 @@ pub fn get_devices() -> Result<(cpal::Device, cpal::Device), String> {
 pub fn resolve_input_config(device: &cpal::Device) -> Result<cpal::StreamConfig, String> {
     let default_config = device.default_input_config()
         .map_err(|e| format!("Failed to get default input config: {:?}", e))?;
-    let mut target_sample_rate = cpal::SampleRate(48000);
+    let mut target_sample_rate = default_config.sample_rate();
     let mut target_channels = default_config.channels();
 
     if let Ok(supported_configs) = device.supported_input_configs() {
@@ -35,7 +35,7 @@ pub fn resolve_input_config(device: &cpal::Device) -> Result<cpal::StreamConfig,
 pub fn resolve_output_config(device: &cpal::Device) -> Result<cpal::StreamConfig, String> {
     let default_config = device.default_output_config()
         .map_err(|e| format!("Failed to get default output config: {:?}", e))?;
-    let mut target_sample_rate = cpal::SampleRate(48000);
+    let mut target_sample_rate = default_config.sample_rate();
     let mut target_channels = default_config.channels();
 
     if let Ok(supported_configs) = device.supported_output_configs() {

@@ -17,6 +17,12 @@ os.environ["CMAKE"] = os.path.abspath("cmake_wrapper.bat")
 os.environ["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 os.environ["CMAKE_VAR_CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 
+TARGETS = [
+    ("x64", "x86_64-pc-windows-msvc"),
+    ("x86", "i686-pc-windows-msvc"),
+    ("arm64", "aarch64-pc-windows-msvc"),
+]
+
 def get_host_arch():
     # Detect host processor architecture and bitness
     machine = platform.machine().lower()
@@ -30,9 +36,8 @@ def get_host_arch():
     else:
         return "x64", "x86_64-pc-windows-msvc"
 
-def compile_and_copy():
-    arch_folder, target_name = get_host_arch()
-    print(f"Building for host target {target_name} ({arch_folder})...")
+def build_single_target(arch_folder, target_name):
+    print(f"\n--- Building for target {target_name} ({arch_folder}) ---")
     
     # Ensure rustup target is installed
     try:
@@ -60,6 +65,24 @@ def compile_and_copy():
     print(f"Copying {dll_path} to {dest_path}")
     shutil.copy2(dll_path, dest_path)
 
+def compile_and_copy(build_all=False):
+    if build_all:
+        print("Building for all supported Windows architectures (x64, x86, ARM64)...")
+        errors = []
+        for arch_folder, target_name in TARGETS:
+            try:
+                build_single_target(arch_folder, target_name)
+            except Exception as e:
+                print(f"Error building {target_name}: {e}")
+                errors.append((target_name, str(e)))
+        if errors:
+            print(f"\nCompleted multi-target build with {len(errors)} error(s):")
+            for target, err in errors:
+                print(f"  - {target}: {err}")
+    else:
+        arch_folder, target_name = get_host_arch()
+        build_single_target(arch_folder, target_name)
+
 def package():
     # Run package function from package_addon.py
     package_addon.package()
@@ -67,6 +90,7 @@ def package():
 def main():
     parser = argparse.ArgumentParser(description="Build and package advanced-nvda-remote add-on")
     parser.add_argument("--test", action="store_true", help="Run the Rust test suite")
+    parser.add_argument("--all", action="store_true", help="Build for all Windows targets (x64, x86, ARM64)")
     args = parser.parse_args()
     
     if args.test:
@@ -87,9 +111,9 @@ def main():
             sys.exit(1)
 
     try:
-        compile_and_copy()
+        compile_and_copy(build_all=args.all)
     except Exception as e:
-        print(f"Error building for host target: {e}")
+        print(f"Error building: {e}")
         sys.exit(1)
                 
     # Run packaging

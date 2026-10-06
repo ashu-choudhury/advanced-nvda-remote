@@ -47,6 +47,9 @@ user32.RegisterClipboardFormatW.restype = ctypes.c_uint
 kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 
+kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+kernel32.GlobalFree.restype = ctypes.c_void_p
+
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 
@@ -64,35 +67,68 @@ class DROPFILES(ctypes.Structure):
         ('fWide', wintypes.BOOL),    # Wide character (Unicode) flag
     )
 
+def is_safe_relpath(base_dir, target_path):
+    """Check that target_path stays strictly within base_dir (Zip Slip defense)."""
+    base_abs = os.path.abspath(base_dir)
+    target_abs = os.path.abspath(target_path)
+    return target_abs == base_abs or target_abs.startswith(base_abs + os.sep)
+
+def sanitize_filename(filename):
+    """Strip directory traversal, drive letters, and dangerous characters."""
+    if not filename:
+        return f"file_{uuid.uuid4().hex[:8]}.dat"
+    # Take only the basename
+    cleaned = os.path.basename(filename)
+    # Strip forbidden Windows filename characters: < > : " / \ | ? *
+    cleaned = "".join(c for c in cleaned if c not in '<>:"/\\|?*').strip(". ")
+    if not cleaned:
+        return f"file_{uuid.uuid4().hex[:8]}.dat"
+    return cleaned
+
 def get_files_from_clipboard():
     """Retrieve absolute file paths from the Windows Clipboard using CF_HDROP."""
     files = []
-    if user32.OpenClipboard(None):
-        try:
-            h_hdrop = user32.GetClipboardData(CF_HDROP)
-            if h_hdrop:
-                file_count = shell32.DragQueryFileW(h_hdrop, -1, None, 0)
-                for i in range(file_count):
-                    path_len = shell32.DragQueryFileW(h_hdrop, i, None, 0)
-                    buffer = ctypes.create_unicode_buffer(path_len + 1)
-                    shell32.DragQueryFileW(h_hdrop, i, buffer, path_len + 1)
-                    files.append(buffer.value)
-        except Exception as e:
-            log.error(f"P2P File Transfer: Error reading clipboard: {e}")
-        finally:
-            user32.CloseClipboard()
+    # Retry briefly in case another process temporarily holds clipboard
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            try:
+                h_hdrop = user32.GetClipboardData(CF_HDROP)
+                if h_hdrop:
+                    file_count = shell32.DragQueryFileW(h_hdrop, -1, None, 0)
+                    for i in range(file_count):
+                        path_len = shell32.DragQueryFileW(h_hdrop, i, None, 0)
+                        buffer = ctypes.create_unicode_buffer(path_len + 1)
+                        shell32.DragQueryFileW(h_hdrop, i, buffer, path_len + 1)
+                        files.append(buffer.value)
+                break
+            except Exception as e:
+                log.error(f"P2P File Transfer: Error reading clipboard: {e}")
+                break
+            finally:
+                user32.CloseClipboard()
+        time.sleep(0.02)
     return files
 
 def set_clipboard_hdrop_and_move(file_paths):
     """Set the clipboard to files/folders and instruct target application to Cut (MOVE)."""
+    if not file_paths:
+        return False
+
     # 1. Prepare files data (UTF-16LE, double null terminated)
     files_data = b"".join([p.encode('utf-16le') + b'\x00\x00' for p in file_paths]) + b'\x00\x00'
     hdrop_size = ctypes.sizeof(DROPFILES) + len(files_data)
     
     # Allocate global memory for CF_HDROP
     h_hdrop = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, hdrop_size)
+    if not h_hdrop:
+        log.error("P2P File Transfer: GlobalAlloc failed for CF_HDROP")
+        return False
+        
     p_hdrop = kernel32.GlobalLock(h_hdrop)
-    
+    if not p_hdrop:
+        kernel32.GlobalFree(h_hdrop)
+        return False
+
     df = DROPFILES()
     df.pFiles = ctypes.sizeof(DROPFILES)
     df.fWide = True
@@ -104,23 +140,44 @@ def set_clipboard_hdrop_and_move(file_paths):
     # 2. Prepare Preferred DropEffect (DROPEFFECT_MOVE = 2 for Cut/Move semantics)
     drop_effect = ctypes.c_ulong(2)
     h_effect = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, ctypes.sizeof(drop_effect))
+    if not h_effect:
+        kernel32.GlobalFree(h_hdrop)
+        log.error("P2P File Transfer: GlobalAlloc failed for DropEffect")
+        return False
+
     p_effect = kernel32.GlobalLock(h_effect)
+    if not p_effect:
+        kernel32.GlobalFree(h_hdrop)
+        kernel32.GlobalFree(h_effect)
+        return False
+
     ctypes.memmove(p_effect, ctypes.byref(drop_effect), ctypes.sizeof(drop_effect))
     kernel32.GlobalUnlock(h_effect)
     
     # 3. Open clipboard, empty it, and set both formats
     success = False
-    if user32.OpenClipboard(None):
-        try:
-            user32.EmptyClipboard()
-            user32.SetClipboardData(CF_HDROP, h_hdrop)
-            CF_PREFERRED_DROPEFFECT = user32.RegisterClipboardFormatW("Preferred DropEffect")
-            user32.SetClipboardData(CF_PREFERRED_DROPEFFECT, h_effect)
-            success = True
-        except Exception as e:
-            log.error(f"P2P File Transfer: Error writing clipboard: {e}")
-        finally:
-            user32.CloseClipboard()
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            try:
+                user32.EmptyClipboard()
+                if user32.SetClipboardData(CF_HDROP, h_hdrop):
+                    CF_PREFERRED_DROPEFFECT = user32.RegisterClipboardFormatW("Preferred DropEffect")
+                    user32.SetClipboardData(CF_PREFERRED_DROPEFFECT, h_effect)
+                    success = True
+                break
+            except Exception as e:
+                log.error(f"P2P File Transfer: Error writing clipboard: {e}")
+                break
+            finally:
+                user32.CloseClipboard()
+        time.sleep(0.03)
+
+    # Prevent Win32 GlobalAlloc memory leak if clipboard open failed:
+    if not success:
+        log.warn("P2P File Transfer: Could not open clipboard. Freeing allocated memory.")
+        kernel32.GlobalFree(h_hdrop)
+        kernel32.GlobalFree(h_effect)
+
     return success
 
 class FileSenderThread(threading.Thread):
@@ -139,15 +196,14 @@ class FileSenderThread(threading.Thread):
         self.bytes_acked += num_bytes
 
     def run(self):
+        source_path = None
+        is_zip = False
         try:
-            # Determine if we should package as zip (if multiple files or a directory)
             is_zip = len(self.paths) > 1 or os.path.isdir(self.paths[0])
-            source_path = None
             filename = None
 
             if is_zip:
                 wx.CallAfter(ui.message, "Packaging files...")
-                # Count files to show zip progress
                 total_files = 0
                 for path in self.paths:
                     if os.path.isdir(path):
@@ -174,18 +230,21 @@ class FileSenderThread(threading.Thread):
                                     arcname = os.path.relpath(file_path, base_dir)
                                     zf.write(file_path, arcname)
                                     files_zipped += 1
-                                    
-                                    percent = int((files_zipped / total_files) * 100)
-                                    if percent // 10 > last_reported // 10:
-                                        last_reported = percent
-                                        wx.CallAfter(ui.message, f"Packaging: {percent}%")
+                                    if total_files > 0:
+                                        percent = int((files_zipped / total_files) * 100)
+                                        if percent // 10 > last_reported // 10:
+                                            last_reported = percent
+                                            wx.CallAfter(ui.message, f"Packaging: {percent}%")
                         else:
                             zf.write(path, os.path.basename(path))
                             files_zipped += 1
 
                 if self.cancelled:
                     if os.path.exists(temp_zip):
-                        os.remove(temp_zip)
+                        try:
+                            os.remove(temp_zip)
+                        except Exception:
+                            pass
                     return
 
                 source_path = temp_zip
@@ -206,78 +265,67 @@ class FileSenderThread(threading.Thread):
             }
             self.send_fn(json.dumps(start_payload))
 
-            # Send chunks with stream compression
-            chunk_size = 32768 # 32KB (safe limit for WebRTC data channels to account for zlib overhead)
+            chunk_size = 32768  # 32KB chunk
             self.bytes_sent = 0
             self.bytes_acked = 0
             last_reported_percent = 0
+            chunk_count = 0
 
             with open(source_path, "rb") as f:
-                chunk_count = 0
                 while self.bytes_sent < file_size and not self.cancelled:
-                    # Flow control: check if we need to pause
-                    # 1. Window check (cheap CPU comparison)
                     window_excess = self.bytes_sent - self.bytes_acked > 1024 * 1024
-                    
-                    # 2. Local buffer check (expensive native call, check every 16 chunks)
                     buffer_excess = False
                     if not window_excess and chunk_count % 16 == 0:
                         buffer_excess = self.get_buffered_amount_fn() > 524288
                         
                     if window_excess or buffer_excess:
-                        first_wait = True
                         while not self.cancelled:
                             window_excess = self.bytes_sent - self.bytes_acked > 1024 * 1024
                             if not window_excess:
-                                local_buf = self.get_buffered_amount_fn()
-                                if local_buf <= 524288:
+                                if self.get_buffered_amount_fn() <= 524288:
                                     break
-                            else:
-                                local_buf = "N/A (window exceeded)"
-                                
-                            if first_wait:
-                                log.info(f"P2P File Transfer: Flow control wait. bytes_sent: {self.bytes_sent}, bytes_acked: {self.bytes_acked}, local_buffered: {local_buf}")
-                                first_wait = False
-                            time.sleep(0.01)
+                            time.sleep(0.02)
 
                     chunk = f.read(chunk_size)
                     if not chunk:
                         break
                     
-                    # Compress chunk using zlib (level 1 = fastest)
                     compressed = zlib.compress(chunk, 1)
-
-                    # Send raw compressed binary chunk on Channel 2
                     self.send_chunk_fn(compressed)
 
                     self.bytes_sent += len(chunk)
                     chunk_count += 1
-                    percent = int((self.bytes_sent / file_size) * 100)
-                    if percent // 10 > last_reported_percent // 10:
-                        last_reported_percent = percent
-                        wx.CallAfter(ui.message, f"Uploading: {percent}%")
-                        # Play a short tick sound
-                        wx.CallAfter(tones.beep, 440, 30)
+                    if file_size > 0:
+                        percent = int((self.bytes_sent / file_size) * 100)
+                        if percent // 10 > last_reported_percent // 10:
+                            last_reported_percent = percent
+                            wx.CallAfter(ui.message, f"Uploading: {percent}%")
+                            wx.CallAfter(tones.beep, 440, 30)
 
-            # Cleanup temp zip if we created one
-            if is_zip and os.path.exists(source_path):
-                os.remove(source_path)
+            if is_zip and source_path and os.path.exists(source_path):
+                try:
+                    os.remove(source_path)
+                except Exception:
+                    pass
 
             if self.cancelled:
                 self.send_fn(json.dumps({"type": "p2p_file_abort"}))
                 wx.CallAfter(ui.message, "File transfer cancelled.")
                 return
 
-            # Send end message
             self.send_fn(json.dumps({"type": "p2p_file_end"}))
             wx.CallAfter(ui.message, "File transfer complete.")
-            # Play success chime
             wx.CallAfter(tones.beep, 523, 100)
             time.sleep(0.1)
             wx.CallAfter(tones.beep, 659, 150)
 
         except Exception as e:
             log.error(f"P2P File Transfer: Error in sender thread: {e}")
+            if is_zip and source_path and os.path.exists(source_path):
+                try:
+                    os.remove(source_path)
+                except Exception:
+                    pass
             self.send_fn(json.dumps({"type": "p2p_file_abort"}))
             wx.CallAfter(ui.message, "File transfer failed.")
 
@@ -291,81 +339,107 @@ class FileReceiver:
         self.file_handle = None
         self.bytes_received = 0
         self.last_reported_percent = 0
+        self._lock = threading.Lock()
 
     def start(self, filename, size, is_zip):
-        self.filename = filename
-        self.size = size
-        self.is_zip = is_zip
-        self.bytes_received = 0
-        self.last_reported_percent = 0
-        
-        # Open temp file directly to write chunks to disk (zero RAM bloat)
-        self.temp_filepath = os.path.join(tempfile.gettempdir(), f"nvda_recv_{uuid.uuid4().hex}.tmp")
-        self.file_handle = open(self.temp_filepath, "wb")
-        
-        wx.CallAfter(ui.message, f"Receiving file: {filename} ({size / (1024*1024):.1f} MB)...")
+        with self._lock:
+            self.filename = sanitize_filename(filename)
+            self.size = size
+            self.is_zip = is_zip
+            self.bytes_received = 0
+            self.last_reported_percent = 0
+            
+            # Open temp file directly to write chunks to disk
+            self.temp_filepath = os.path.join(tempfile.gettempdir(), f"nvda_recv_{uuid.uuid4().hex}.tmp")
+            self.file_handle = open(self.temp_filepath, "wb")
+            
+            wx.CallAfter(ui.message, f"Receiving file: {self.filename} ({size / (1024*1024):.1f} MB)...")
 
     def write_chunk(self, data):
-        if not self.file_handle:
-            return
-        
-        # Support base64 strings from older senders for backward compatibility
-        if isinstance(data, str):
-            compressed = base64.b64decode(data.encode('utf-8') if hasattr(data, 'encode') else data)
-        else:
-            compressed = data
+        with self._lock:
+            if not self.file_handle:
+                return 0
             
-        chunk = zlib.decompress(compressed)
-        
-        self.file_handle.write(chunk)
-        self.bytes_received += len(chunk)
-        
-        # Report progress
-        if self.size > 0:
-            percent = int((self.bytes_received / self.size) * 100)
-            if percent // 10 > self.last_reported_percent // 10:
-                self.last_reported_percent = percent
-                wx.CallAfter(ui.message, f"Downloading: {percent}%")
-                wx.CallAfter(tones.beep, 550, 30)
+            if isinstance(data, str):
+                compressed = base64.b64decode(data.encode('utf-8') if hasattr(data, 'encode') else data)
+            else:
+                compressed = data
+                
+            chunk = zlib.decompress(compressed)
+            self.file_handle.write(chunk)
+            self.bytes_received += len(chunk)
+            
+            if self.size > 0:
+                percent = int((self.bytes_received / self.size) * 100)
+                if percent // 10 > self.last_reported_percent // 10:
+                    self.last_reported_percent = percent
+                    wx.CallAfter(ui.message, f"Downloading: {percent}%")
+                    wx.CallAfter(tones.beep, 550, 30)
 
-        return len(chunk)
+            return len(chunk)
 
     def finalize(self):
-        if self.file_handle:
-            self.file_handle.close()
-            self.file_handle = None
+        """Asynchronously finalize file receive on a background thread so transport loop never blocks."""
+        with self._lock:
+            if self.file_handle:
+                try:
+                    self.file_handle.close()
+                except Exception:
+                    pass
+                self.file_handle = None
 
-        if not self.temp_filepath or not os.path.exists(self.temp_filepath):
+            temp_path = self.temp_filepath
+            filename = self.filename
+            is_zip = self.is_zip
+
+        if not temp_path or not os.path.exists(temp_path):
             return
 
+        # Offload decompression & clipboard writing to a worker thread
+        worker = threading.Thread(
+            target=self._finalize_worker,
+            args=(temp_path, filename, is_zip),
+            daemon=True
+        )
+        worker.start()
+
+    def _finalize_worker(self, temp_path, filename, is_zip):
         final_paths = []
         try:
-            if self.is_zip:
+            if is_zip:
                 wx.CallAfter(ui.message, "Extracting files...")
                 extract_dir = os.path.join(tempfile.gettempdir(), f"nvda_ext_{uuid.uuid4().hex}")
                 os.makedirs(extract_dir, exist_ok=True)
                 
-                with zipfile.ZipFile(self.temp_filepath, 'r') as zf:
-                    zf.extractall(extract_dir)
+                with zipfile.ZipFile(temp_path, 'r') as zf:
+                    for member in zf.infolist():
+                        # Prevent Zip Slip / path traversal
+                        target_path = os.path.join(extract_dir, member.filename)
+                        if not is_safe_relpath(extract_dir, target_path):
+                            log.error(f"P2P File Transfer: Skipped unsafe zip member: {member.filename}")
+                            continue
+                        zf.extract(member, extract_dir)
                 
-                # Cleanup temp zip file
-                os.remove(self.temp_filepath)
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
                 
-                # Gather top level items in extracted dir
                 final_paths = [os.path.join(extract_dir, name) for name in os.listdir(extract_dir)]
             else:
-                # Rename the temp file to the original filename in temp folder
-                dest_path = os.path.join(tempfile.gettempdir(), self.filename)
+                safe_name = sanitize_filename(filename)
+                dest_path = os.path.join(tempfile.gettempdir(), safe_name)
                 # Overwrite if exists
                 if os.path.exists(dest_path):
-                    os.remove(dest_path)
-                os.rename(self.temp_filepath, dest_path)
+                    try:
+                        os.remove(dest_path)
+                    except Exception:
+                        pass
+                os.rename(temp_path, dest_path)
                 final_paths = [dest_path]
 
-            # Write to clipboard with Cut/Move effect
             if set_clipboard_hdrop_and_move(final_paths):
                 wx.CallAfter(ui.message, "File ready. Press Control V to paste.")
-                # Play success chime
                 wx.CallAfter(tones.beep, 659, 100)
                 time.sleep(0.1)
                 wx.CallAfter(tones.beep, 523, 150)
@@ -374,22 +448,27 @@ class FileReceiver:
         except Exception as e:
             log.error(f"P2P File Transfer: Error finalizing received file: {e}")
             wx.CallAfter(ui.message, "File extraction failed.")
-            self.cleanup()
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
     def abort(self):
         self.cleanup()
         wx.CallAfter(ui.message, "File transfer aborted.")
 
     def cleanup(self):
-        if self.file_handle:
-            try:
-                self.file_handle.close()
-            except Exception:
-                pass
-            self.file_handle = None
-        if self.temp_filepath and os.path.exists(self.temp_filepath):
-            try:
-                os.remove(self.temp_filepath)
-            except Exception:
-                pass
-            self.temp_filepath = None
+        with self._lock:
+            if self.file_handle:
+                try:
+                    self.file_handle.close()
+                except Exception:
+                    pass
+                self.file_handle = None
+            if self.temp_filepath and os.path.exists(self.temp_filepath):
+                try:
+                    os.remove(self.temp_filepath)
+                except Exception:
+                    pass
+                self.temp_filepath = None

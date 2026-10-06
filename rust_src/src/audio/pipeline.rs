@@ -6,8 +6,6 @@ use sonora::AudioProcessing;
 use tokio::sync::mpsc::UnboundedSender;
 use crate::audio::jitter::JitterBuffer;
 
-// We no longer use a structured AudioPacket struct; data is serialized as a raw binary packet: [stream_id, ...payload]
-
 // Thread-safe wrapper for cpal::Stream (specifically WASAPI raw COM pointers on Windows)
 pub struct SendStream(pub cpal::Stream);
 unsafe impl Send for SendStream {}
@@ -42,23 +40,28 @@ impl AudioPipeline {
         // Opus encoder setup (Mono, 48kHz, Voip mode)
         let mut encoder = Encoder::new(48000, Channels::Mono, Application::Voip)
             .map_err(|e| format!("Failed to create Opus encoder: {:?}", e))?;
-        encoder.set_bitrate(opus::Bitrate::Bits(32000)) // 32kbps is clear for speech
+        encoder.set_bitrate(opus::Bitrate::Bits(32000))
             .map_err(|e| format!("Failed to set Opus bitrate: {:?}", e))?;
 
         let has_error = Arc::new(Mutex::new(false));
         let render_buffer = Arc::new(Mutex::new(VecDeque::new()));
 
-        // Loopback stream setup (WASAPI loopback)
+        // Loopback stream setup (WASAPI loopback). Made resilient: if unsupported, continues without AEC loopback.
         let loopback_config = output_stream_config.clone();
         let loopback_channels = loopback_config.channels as usize;
         let render_buffer_loopback = Arc::clone(&render_buffer);
         let has_error_loopback = Arc::clone(&has_error);
 
-        let loopback_stream = output_device.build_input_stream(
+        let loopback_stream = match output_device.build_input_stream(
             &loopback_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if let Ok(mut rb) = render_buffer_loopback.lock() {
-                    if loopback_channels == 1 {
+                    // Prevent unbounded memory leak: cap buffer to maximum 960 samples (20ms at 48kHz)
+                    if rb.len() > 960 {
+                        let excess = rb.len() - 960;
+                        rb.drain(..excess);
+                    }
+                    if loopback_channels <= 1 {
                         rb.extend(data);
                     } else {
                         let mut i = 0;
@@ -82,7 +85,16 @@ impl AudioPipeline {
                 }
             },
             None
-        ).map_err(|e| format!("Failed to build CPAL loopback stream: {:?}", e))?;
+        ) {
+            Ok(stream) => {
+                let _ = stream.play();
+                Some(SendStream(stream))
+            }
+            Err(err) => {
+                eprintln!("Notice: WASAPI loopback not available on this device ({:?}). Voice chat running without echo cancellation.", err);
+                None
+            }
+        };
 
         // Microphone capture stream
         let mut capture_buffer = Vec::new();
@@ -95,13 +107,16 @@ impl AudioPipeline {
         let input_stream = input_device.build_input_stream(
             &input_stream_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // If microphone is muted, skip capture entirely
+                // If microphone is muted, skip capture and clear render buffer to prevent memory leaks and stale echo
                 if *is_muted_capture.lock().unwrap() {
+                    if let Ok(mut rb) = render_buffer_capture.lock() {
+                        rb.clear();
+                    }
                     return;
                 }
 
                 // Downmix input channels to Mono
-                if num_input_channels == 1 {
+                if num_input_channels <= 1 {
                     capture_buffer.extend_from_slice(data);
                 } else {
                     let mut i = 0;
@@ -176,10 +191,11 @@ impl AudioPipeline {
             &output_stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut jb = jb_playback.lock().unwrap();
-                if output_channels == 1 {
+                if output_channels <= 1 {
                     jb.pop(data);
                 } else {
-                    let mut mono_buffer = vec![0.0f32; data.len() / output_channels];
+                    let mono_len = data.len() / output_channels;
+                    let mut mono_buffer = vec![0.0f32; mono_len];
                     jb.pop(&mut mono_buffer);
                     let mut write_idx = 0;
                     for &sample in &mono_buffer {
@@ -189,6 +205,10 @@ impl AudioPipeline {
                                 write_idx += 1;
                             }
                         }
+                    }
+                    while write_idx < data.len() {
+                        data[write_idx] = 0.0;
+                        write_idx += 1;
                     }
                 }
             },
@@ -204,12 +224,11 @@ impl AudioPipeline {
         // Start streams
         input_stream.play().map_err(|e| format!("Failed to start input stream: {:?}", e))?;
         output_stream.play().map_err(|e| format!("Failed to start output stream: {:?}", e))?;
-        loopback_stream.play().map_err(|e| format!("Failed to start loopback stream: {:?}", e))?;
 
         Ok(Self {
             input_stream: Some(SendStream(input_stream)),
             output_stream: Some(SendStream(output_stream)),
-            loopback_stream: Some(SendStream(loopback_stream)),
+            loopback_stream,
             is_muted,
             jitter_buffer,
             apm,

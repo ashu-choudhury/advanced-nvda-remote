@@ -10,6 +10,7 @@ import select
 import globalPluginHandler
 import json
 from . import p2p_file_transfer
+from . import updater
 from logHandler import log
 
 def get_architecture_folder():
@@ -224,6 +225,9 @@ class P2PRelayTransport(RelayTransport):
                             log.error(f"P2P Override: Failed to recover audio pipeline: {e}")
         finally:
             log.info("P2P Override: Exited transport read loop. Cleaning up...")
+            self.use_webrtc = False
+            self.webrtc_started = False
+            self.sig_candidates_sent.clear()
             self.connected = False
             self.connectedEvent.clear()
             self.transportDisconnected.notify()
@@ -235,7 +239,13 @@ class P2PRelayTransport(RelayTransport):
             if hasattr(self, "file_receiver") and self.file_receiver:
                 self.file_receiver.cleanup()
                 self.file_receiver = None
-            p2p_webrtc.close()
+            if hasattr(self, "file_sender") and self.file_sender:
+                self.file_sender.cancelled = True
+                self.file_sender = None
+            try:
+                p2p_webrtc.close()
+            except Exception:
+                pass
 
     def send_to_relay(self, type, **kwargs):
         """Helper to send packets strictly to the relay server during signaling phase."""
@@ -400,6 +410,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         super().__init__()
         # Overwrite the built-in transport with our P2P WebRTC transport subclass!
         log.info("P2P Override: Installing monkey-patch for _remoteClient.client.RelayTransport...")
+        self.original_RelayTransport = _remoteClient.client.RelayTransport
         _remoteClient.client.RelayTransport = P2PRelayTransport
 
         # Register local scripts
@@ -444,7 +455,37 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except Exception as e:
             log.error(f"P2P Override: Failed to patch pushClipboard: {e}")
 
+        # Add item to NVDA Tools menu
+        self.updateMenuItem = None
+        try:
+            import gui
+            import wx
+            toolsMenu = getattr(gui.mainFrame.sysTrayIcon, "toolsMenu", None)
+            if toolsMenu:
+                self.updateMenuItem = toolsMenu.Append(
+                    wx.ID_ANY,
+                    "Check for Advanced NVDA Remote &update...",
+                    "Check if a newer version of Advanced NVDA Remote is available on GitHub"
+                )
+                gui.mainFrame.sysTrayIcon.Bind(wx.EVT_MENU, self.onCheckUpdate, self.updateMenuItem)
+        except Exception as e:
+            log.warn(f"P2P Override: Could not add Tools menu item: {e}")
+
+        # Check for updates in background
+        updater.updater_instance.start_background_check()
+
     def terminate(self):
+        # Remove Tools menu item
+        try:
+            if hasattr(self, "updateMenuItem") and self.updateMenuItem:
+                import gui
+                toolsMenu = getattr(gui.mainFrame.sysTrayIcon, "toolsMenu", None)
+                if toolsMenu:
+                    toolsMenu.Remove(self.updateMenuItem)
+                self.updateMenuItem = None
+        except Exception as e:
+            log.warn(f"P2P Override: Could not remove Tools menu item: {e}")
+
         # Unregister local scripts
         try:
             if _remoteClient._remoteClient is not None:
@@ -463,10 +504,30 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except Exception as e:
             log.error(f"P2P Override: Failed to restore pushClipboard: {e}")
 
+        # Restore original RelayTransport
+        try:
+            if hasattr(self, "original_RelayTransport"):
+                _remoteClient.client.RelayTransport = self.original_RelayTransport
+                log.info("P2P Override: Restored original RemoteClient.RelayTransport.")
+        except Exception as e:
+            log.error(f"P2P Override: Failed to restore RelayTransport: {e}")
+
         super().terminate()
+
+    def onCheckUpdate(self, event):
+        updater.updater_instance.check_now(manual=True)
+
+    def script_checkUpdate(self, gesture):
+        updater.updater_instance.check_now(manual=True)
+
+    script_checkUpdate.category = "Advanced NVDA Remote"
+    script_checkUpdate.__doc__ = "Checks for Advanced NVDA Remote updates on GitHub."
+
+    scriptCategory = "Advanced NVDA Remote"
 
     def script_toggleMicrophone(self, gesture):
         if not webrtc_available:
+            gesture.send()
             return
         
         try:
@@ -486,11 +547,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             log.error(f"P2P Override: Error toggling microphone: {e}")
 
     # Set script category and gesture bindings
-    script_toggleMicrophone.category = "P2P NVDA Remote"
+    script_toggleMicrophone.category = "Advanced NVDA Remote"
     script_toggleMicrophone.__doc__ = "Toggles the microphone state for voice communication during a P2P session."
     
     def script_cancelFileTransfer(self, gesture):
-        client_inst = _remoteClient._remoteClient
+        client_inst = getattr(_remoteClient, "_remoteClient", None)
         if not client_inst:
             ui.message("Not connected")
             return
@@ -515,11 +576,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         else:
             ui.message("No active file transfer")
 
-    script_cancelFileTransfer.category = "P2P NVDA Remote"
+    script_cancelFileTransfer.category = "Advanced NVDA Remote"
     script_cancelFileTransfer.__doc__ = "Cancels the active P2P file transfer."
 
     def script_pingPeer(self, gesture):
-        client_inst = _remoteClient._remoteClient
+        client_inst = getattr(_remoteClient, "_remoteClient", None)
         if not client_inst:
             ui.message("Not connected")
             return
@@ -534,16 +595,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             "type": "p2p_ping",
             "timestamp": timestamp
         }
-        if p2p_webrtc.send_file_message(json.dumps(payload)):
-            pass
-        else:
+        if not p2p_webrtc.send_file_message(json.dumps(payload)):
             ui.message("Failed to send ping")
 
-    script_pingPeer.category = "P2P NVDA Remote"
+    script_pingPeer.category = "Advanced NVDA Remote"
     script_pingPeer.__doc__ = "Pings the peer device to measure latency."
     
     __gestures = {
-        "kb:control+shift+m": "toggleMicrophone",
-        "kb:control+shift+c": "cancelFileTransfer",
+        "kb:nvda+alt+m": "toggleMicrophone",
+        "kb:nvda+alt+c": "cancelFileTransfer",
         "kb:nvda+alt+p": "pingPeer"
     }

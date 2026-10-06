@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex, Condvar};
 use std::collections::VecDeque;
+use std::time::Duration;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 use webrtc::api::APIBuilder;
@@ -114,13 +115,21 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
+        let ic_state_leader = Arc::clone(&is_connected_clone);
+        let cv_state_leader = Arc::clone(&received_condvar_clone);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             log_to_python(&format!("Leader PeerConnection State Changed: {:?}", state));
+            if state == RTCPeerConnectionState::Failed
+                || state == RTCPeerConnectionState::Disconnected
+                || state == RTCPeerConnectionState::Closed
+            {
+                let mut ic = ic_state_leader.lock().unwrap();
+                *ic = false;
+                cv_state_leader.notify_all();
+            }
             Box::pin(async {})
         }));
 
-
- 
         let dc = pc
             .create_data_channel("nvda-remote", None)
             .await
@@ -169,7 +178,6 @@ pub fn init_leader(stun_servers: Vec<String>) -> Result<(), String> {
             if let Some(ref audio_state) = *audio_state_guard {
                 let decoder = Arc::clone(&audio_state.decoder);
                 let jb = Arc::clone(&audio_state.jitter_buffer);
-                // Decode synchronously in the WebRTC receive callback for maximum latency reduction and zero jitter
                 if data.len() > 1 {
                     let stream_id = data[0];
                     let payload = &data[1..];
@@ -281,12 +289,20 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
             Box::pin(async {})
         }));
 
+        let ic_state_follower = Arc::clone(&is_connected_clone);
+        let cv_state_follower = Arc::clone(&received_condvar_clone);
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             log_to_python(&format!("Follower PeerConnection State Changed: {:?}", state));
+            if state == RTCPeerConnectionState::Failed
+                || state == RTCPeerConnectionState::Disconnected
+                || state == RTCPeerConnectionState::Closed
+            {
+                let mut ic = ic_state_follower.lock().unwrap();
+                *ic = false;
+                cv_state_follower.notify_all();
+            }
             Box::pin(async {})
         }));
-
-
 
         let ic_clone = Arc::clone(&is_connected_clone);
         let rm_clone = Arc::clone(&received_messages_clone);
@@ -309,7 +325,6 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
                     if let Some(ref audio_state) = *audio_state_guard {
                         let decoder = Arc::clone(&audio_state.decoder);
                         let jb = Arc::clone(&audio_state.jitter_buffer);
-                        // Decode synchronously in the WebRTC receive callback for maximum latency reduction and zero jitter
                         if data.len() > 1 {
                             let stream_id = data[0];
                             let payload = &data[1..];
@@ -399,93 +414,103 @@ pub fn init_follower(stun_servers: Vec<String>) -> Result<(), String> {
 }
 
 pub fn create_offer() -> Result<String, String> {
-    let state_guard = STATE.lock().unwrap();
-    if let Some(ref state) = *state_guard {
-        let pc = Arc::clone(&state.peer_connection);
-        let offer = RUNTIME.block_on(async move {
-            let offer = pc.create_offer(None).await
-                .map_err(|e| format!("Failed to create offer: {:?}", e))?;
-            pc.set_local_description(offer.clone()).await
-                .map_err(|e| format!("Failed to set local description: {:?}", e))?;
-            Ok::<RTCSessionDescription, String>(offer)
-        })?;
-        let sdp_json = serde_json::to_string(&offer)
-            .map_err(|e| format!("Failed to serialize offer: {:?}", e))?;
-        Ok(sdp_json)
-    } else {
-        Err("PeerConnection not initialized".to_string())
-    }
+    let pc = {
+        let state_guard = STATE.lock().unwrap();
+        if let Some(ref state) = *state_guard {
+            Arc::clone(&state.peer_connection)
+        } else {
+            return Err("PeerConnection not initialized".to_string());
+        }
+    };
+    let offer = RUNTIME.block_on(async move {
+        let offer = pc.create_offer(None).await
+            .map_err(|e| format!("Failed to create offer: {:?}", e))?;
+        pc.set_local_description(offer.clone()).await
+            .map_err(|e| format!("Failed to set local description: {:?}", e))?;
+        Ok::<RTCSessionDescription, String>(offer)
+    })?;
+    let sdp_json = serde_json::to_string(&offer)
+        .map_err(|e| format!("Failed to serialize offer: {:?}", e))?;
+    Ok(sdp_json)
 }
 
 pub fn set_offer(offer_json: String) -> Result<(), String> {
     log_to_python("set_offer called");
-    let state_guard = STATE.lock().unwrap();
-    if let Some(ref state) = *state_guard {
-        let pc = Arc::clone(&state.peer_connection);
-        let offer: RTCSessionDescription = serde_json::from_str(&offer_json)
-            .map_err(|e| format!("Failed to parse offer JSON: {:?}", e))?;
-        RUNTIME.block_on(async move {
-            pc.set_remote_description(offer).await
-                .map_err(|e| format!("Failed to set remote description: {:?}", e))
-        })?;
-        Ok(())
-    } else {
-        Err("PeerConnection not initialized".to_string())
-    }
+    let pc = {
+        let state_guard = STATE.lock().unwrap();
+        if let Some(ref state) = *state_guard {
+            Arc::clone(&state.peer_connection)
+        } else {
+            return Err("PeerConnection not initialized".to_string());
+        }
+    };
+    let offer: RTCSessionDescription = serde_json::from_str(&offer_json)
+        .map_err(|e| format!("Failed to parse offer JSON: {:?}", e))?;
+    RUNTIME.block_on(async move {
+        pc.set_remote_description(offer).await
+            .map_err(|e| format!("Failed to set remote description: {:?}", e))
+    })?;
+    Ok(())
 }
 
 pub fn create_answer() -> Result<String, String> {
     log_to_python("create_answer called");
-    let state_guard = STATE.lock().unwrap();
-    if let Some(ref state) = *state_guard {
-        let pc = Arc::clone(&state.peer_connection);
-        let answer = RUNTIME.block_on(async move {
-            let answer = pc.create_answer(None).await
-                .map_err(|e| format!("Failed to create answer: {:?}", e))?;
-            pc.set_local_description(answer.clone()).await
-                .map_err(|e| format!("Failed to set local description: {:?}", e))?;
-            Ok::<RTCSessionDescription, String>(answer)
-        })?;
-        let sdp_json = serde_json::to_string(&answer)
-            .map_err(|e| format!("Failed to serialize answer: {:?}", e))?;
-        Ok(sdp_json)
-    } else {
-        Err("PeerConnection not initialized".to_string())
-    }
+    let pc = {
+        let state_guard = STATE.lock().unwrap();
+        if let Some(ref state) = *state_guard {
+            Arc::clone(&state.peer_connection)
+        } else {
+            return Err("PeerConnection not initialized".to_string());
+        }
+    };
+    let answer = RUNTIME.block_on(async move {
+        let answer = pc.create_answer(None).await
+            .map_err(|e| format!("Failed to create answer: {:?}", e))?;
+        pc.set_local_description(answer.clone()).await
+            .map_err(|e| format!("Failed to set local description: {:?}", e))?;
+        Ok::<RTCSessionDescription, String>(answer)
+    })?;
+    let sdp_json = serde_json::to_string(&answer)
+        .map_err(|e| format!("Failed to serialize answer: {:?}", e))?;
+    Ok(sdp_json)
 }
 
 pub fn set_answer(answer_json: String) -> Result<(), String> {
     log_to_python("set_answer called");
-    let state_guard = STATE.lock().unwrap();
-    if let Some(ref state) = *state_guard {
-        let pc = Arc::clone(&state.peer_connection);
-        let answer: RTCSessionDescription = serde_json::from_str(&answer_json)
-            .map_err(|e| format!("Failed to parse answer JSON: {:?}", e))?;
-        RUNTIME.block_on(async move {
-            pc.set_remote_description(answer).await
-                .map_err(|e| format!("Failed to set remote description: {:?}", e))
-        })?;
-        Ok(())
-    } else {
-        Err("PeerConnection not initialized".to_string())
-    }
+    let pc = {
+        let state_guard = STATE.lock().unwrap();
+        if let Some(ref state) = *state_guard {
+            Arc::clone(&state.peer_connection)
+        } else {
+            return Err("PeerConnection not initialized".to_string());
+        }
+    };
+    let answer: RTCSessionDescription = serde_json::from_str(&answer_json)
+        .map_err(|e| format!("Failed to parse answer JSON: {:?}", e))?;
+    RUNTIME.block_on(async move {
+        pc.set_remote_description(answer).await
+            .map_err(|e| format!("Failed to set remote description: {:?}", e))
+    })?;
+    Ok(())
 }
 
 pub fn add_ice_candidate(candidate_json: String) -> Result<(), String> {
     log_to_python(&format!("add_ice_candidate: {}", candidate_json));
-    let state_guard = STATE.lock().unwrap();
-    if let Some(ref state) = *state_guard {
-        let pc = Arc::clone(&state.peer_connection);
-        let candidate: RTCIceCandidateInit = serde_json::from_str(&candidate_json)
-            .map_err(|e| format!("Failed to parse ICE candidate JSON: {:?}", e))?;
-        RUNTIME.block_on(async move {
-            pc.add_ice_candidate(candidate).await
-                .map_err(|e| format!("Failed to add remote ICE candidate: {:?}", e))
-        })?;
-        Ok(())
-    } else {
-        Err("PeerConnection not initialized".to_string())
-    }
+    let pc = {
+        let state_guard = STATE.lock().unwrap();
+        if let Some(ref state) = *state_guard {
+            Arc::clone(&state.peer_connection)
+        } else {
+            return Err("PeerConnection not initialized".to_string());
+        }
+    };
+    let candidate: RTCIceCandidateInit = serde_json::from_str(&candidate_json)
+        .map_err(|e| format!("Failed to parse ICE candidate JSON: {:?}", e))?;
+    RUNTIME.block_on(async move {
+        pc.add_ice_candidate(candidate).await
+            .map_err(|e| format!("Failed to add remote ICE candidate: {:?}", e))
+    })?;
+    Ok(())
 }
 
 pub fn get_local_candidates() -> Result<Vec<String>, String> {
@@ -529,11 +554,18 @@ pub fn recv_message() -> Result<Option<(u8, Vec<u8>)>, String> {
         } else {
             return Ok(None);
         }
-    }; // state_guard is dropped here!
+    };
 
     let mut rm = received_messages.lock().unwrap();
+    // Non-blocking timeout wait: 150ms timeout ensures we never freeze if peer disconnects without SCTP close
     while rm.is_empty() && *is_connected.lock().unwrap() {
-        rm = received_condvar.wait(rm).unwrap();
+        let (guard, timeout_result) = received_condvar
+            .wait_timeout(rm, Duration::from_millis(150))
+            .unwrap();
+        rm = guard;
+        if timeout_result.timed_out() {
+            break;
+        }
     }
     Ok(rm.pop_front())
 }
@@ -671,8 +703,6 @@ pub fn send_file_message(msg: String) -> Result<bool, String> {
     }
 }
 
-
-
 pub fn send_file_chunk(data: Vec<u8>) -> Result<bool, String> {
     let state_guard = STATE.lock().unwrap();
     if let Some(ref state) = *state_guard {
@@ -693,17 +723,19 @@ pub fn send_file_chunk(data: Vec<u8>) -> Result<bool, String> {
 }
 
 pub fn get_file_buffered_amount() -> Result<usize, String> {
-    let state_guard = STATE.lock().unwrap();
-    if let Some(ref state) = *state_guard {
-        if let Some(ref dc) = state.file_channel {
-            let dc_clone = Arc::clone(dc);
-            let amount = RUNTIME.block_on(async move {
-                dc_clone.buffered_amount().await
-            });
-            Ok(amount)
+    let dc = {
+        let state_guard = STATE.lock().unwrap();
+        if let Some(ref state) = *state_guard {
+            state.file_channel.as_ref().map(Arc::clone)
         } else {
-            Ok(0)
+            None
         }
+    };
+    if let Some(dc) = dc {
+        let amount = RUNTIME.block_on(async move {
+            dc.buffered_amount().await
+        });
+        Ok(amount)
     } else {
         Ok(0)
     }
@@ -719,17 +751,23 @@ pub fn has_file_channel() -> Result<bool, String> {
 }
 
 pub fn close() -> Result<(), String> {
-    let mut audio_state_guard = AUDIO_STATE.lock().unwrap();
-    *audio_state_guard = None;
+    let _ = stop_audio();
 
-    let mut state_guard = STATE.lock().unwrap();
-    if let Some(state) = state_guard.take() {
-        {
-            let mut ic = state.is_connected.lock().unwrap();
-            *ic = false;
+    let pc = {
+        let mut state_guard = STATE.lock().unwrap();
+        if let Some(state) = state_guard.take() {
+            {
+                let mut ic = state.is_connected.lock().unwrap();
+                *ic = false;
+            }
+            state.received_condvar.notify_all();
+            Some(state.peer_connection)
+        } else {
+            None
         }
-        state.received_condvar.notify_all();
-        let pc = state.peer_connection;
+    };
+
+    if let Some(pc) = pc {
         RUNTIME.block_on(async move {
             let _ = pc.close().await;
         });
@@ -765,7 +803,6 @@ pub fn check_default_devices_changed() -> Result<bool, String> {
         Ok(false)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -886,4 +923,3 @@ mod tests {
         let _ = stop_audio();
     }
 }
-

@@ -22,8 +22,8 @@ def package():
     with zipfile.ZipFile(target_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(addon_dir):
             for file in files:
-                # Do not package temporary files
-                if file.endswith('.pyc') or '__pycache__' in root:
+                # Do not package temporary or hidden files
+                if file.endswith(('.pyc', '.pyo', '.tmp')) or '__pycache__' in root or file.startswith('.'):
                     continue
                 file_path = os.path.join(root, file)
                 arcname = os.path.relpath(file_path, addon_dir)
